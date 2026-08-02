@@ -158,6 +158,19 @@ func TestDashboardHistoryLimit(t *testing.T) {
 	}
 }
 
+func TestDashboardHistoryLinkForEmptyPortfolio(t *testing.T) {
+	a := testApp(t)
+	owner := setupUser(t, a, "owner")
+
+	w := authenticatedGet(t, a, owner, "/")
+	if w.Code != http.StatusOK {
+		t.Fatalf("dashboard status %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `href="/history">View all history`) {
+		t.Fatal("empty dashboard history link missing")
+	}
+}
+
 func TestPortfolioHistory(t *testing.T) {
 	a := testApp(t)
 	owner := setupUser(t, a, "owner")
