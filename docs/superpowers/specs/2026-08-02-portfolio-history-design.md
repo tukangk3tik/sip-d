@@ -7,9 +7,9 @@ snapshots, while providing a dedicated page for the complete history.
 
 ## Navigation
 
-The authenticated sidebar gains a **Portfolio history** link to `/history`.
-The Dashboard's existing Portfolio history section includes a **View all
-history** link to the same page.
+The complete history remains a dedicated `/history` page, reached only from
+the Dashboard's **Portfolio history** section through its **View all history**
+link. The authenticated sidebar is unchanged.
 
 ## Data Flow
 

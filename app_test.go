@@ -185,8 +185,8 @@ func TestPortfolioHistory(t *testing.T) {
 		t.Fatalf("history status %d: %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, `href="/history">History`) {
-		t.Fatal("history navigation link missing")
+	if strings.Contains(body, `sidebar-nav" aria-label="Main navigation"><a href="/">Dashboard</a><a href="/history">History`) {
+		t.Fatal("history must be accessed from the dashboard, not the sidebar")
 	}
 	if strings.Contains(body, "Rp 9.999") {
 		t.Fatal("history rendered another user's snapshot")
