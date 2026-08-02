@@ -30,7 +30,9 @@ jobs:
           CGO_ENABLED: '1'
           GOOS: linux
           GOARCH: amd64
-        run: go build -trimpath -ldflags='-s -w' -o dist/sip-d .
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags='-s -w' -o dist/sip-d .
 
       - name: Upload deployment binary
         uses: actions/upload-artifact@v4
@@ -43,6 +45,9 @@ jobs:
     needs: validate
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    concurrency:
+      group: sip-d-production
+      cancel-in-progress: false
     steps:
       - name: Download deployment binary
         uses: actions/download-artifact@v4
@@ -50,7 +55,7 @@ jobs:
           name: sip-d-linux-amd64
 
       - name: Upload binary to VPS
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
@@ -60,7 +65,7 @@ jobs:
           target: /tmp/
 
       - name: Install and verify deployment
-        uses: appleboy/ssh-action@v1.2.0
+        uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
@@ -74,4 +79,4 @@ jobs:
             fi
             sudo mv /opt/sip-d/sip-d.new /opt/sip-d/sip-d
             sudo systemctl restart sip-d
-            curl --fail --retry 5 --retry-delay 2 http://127.0.0.1:8090/healthz
+            curl --fail --retry 5 --retry-delay 2 --retry-connrefused http://127.0.0.1:8090/healthz
