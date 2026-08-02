@@ -39,7 +39,7 @@ func TestRoutesBuildAndServeEmbeddedWebAwesome(t *testing.T) {
 func TestAuthenticatedPageUsesAdminShell(t *testing.T) {
 	a := testApp(t)
 	var page bytes.Buffer
-	if err := a.tpl.Execute(&page, Page{Title: "Dashboard", View: "dashboard", User: &User{Username: "owner"}}); err != nil {
+	if err := a.tpl.Execute(&page, Page{Title: "Dashboard", View: "dashboard", User: &User{Username: "owner"}, Currency: "IDR", TypeAlloc: []Allocation{{Name: "Stocks", Value: decimal.NewFromInt(750000), Percent: decimal.NewFromInt(75)}}, AssetAlloc: []Allocation{{Name: "BBCA", Value: decimal.NewFromInt(500000), Percent: decimal.NewFromInt(50)}}}); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"admin-shell", "sidebar-nav", `id="nav-toggle"`, `id="nav-backdrop"`} {
@@ -49,6 +49,14 @@ func TestAuthenticatedPageUsesAdminShell(t *testing.T) {
 	}
 	if strings.Contains(page.String(), "alpine") || strings.Contains(page.String(), "x-data") {
 		t.Fatal("authenticated layout still loads Alpine")
+	}
+	transactions := strings.Index(page.String(), `href="/transactions">Transactions`)
+	assets := strings.Index(page.String(), `href="/assets">Assets`)
+	if transactions < 0 || assets < 0 || transactions > assets {
+		t.Fatal("Transactions must appear before Assets in navigation")
+	}
+	if !strings.Contains(page.String(), `<progress max="100" value="75"`) || !strings.Contains(page.String(), "allocation-list") {
+		t.Fatal("dashboard allocation progress is missing")
 	}
 }
 
