@@ -54,12 +54,17 @@ jobs:
         with:
           name: sip-d-linux-amd64
 
-      - name: Verify deployment host fingerprint is configured
+      - name: Verify deployment credentials are configured
         env:
           DEPLOY_HOST_FINGERPRINT: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
+          DEPLOY_SSH_PASSWORD: ${{ secrets.DEPLOY_SSH_PASSWORD }}
         run: |
           if [ -z "$DEPLOY_HOST_FINGERPRINT" ]; then
             echo "DEPLOY_HOST_FINGERPRINT must be configured."
+            exit 1
+          fi
+          if [ -z "$DEPLOY_SSH_PASSWORD" ]; then
+            echo "DEPLOY_SSH_PASSWORD must be configured."
             exit 1
           fi
 
@@ -68,7 +73,7 @@ jobs:
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          password: ${{ secrets.DEPLOY_SSH_PASSWORD }}
           fingerprint: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
           source: sip-d
@@ -79,7 +84,7 @@ jobs:
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          password: ${{ secrets.DEPLOY_SSH_PASSWORD }}
           fingerprint: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
           script: |
