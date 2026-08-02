@@ -11,5 +11,6 @@
 /*.log
 /data/
 /node_modules/
+/.worktrees/
 /deploy/sip-d.env
 /deploy/nginx.sip-d.conf
