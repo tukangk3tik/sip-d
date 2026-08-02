@@ -1,0 +1,15 @@
+/sip-d
+/.env
+/.env.*
+!/.env.example
+/*.db
+/*.db-*
+/*.sqlite
+/*.sqlite-*
+/*.pem
+/*.key
+/*.log
+/data/
+/node_modules/
+/deploy/sip-d.env
+/deploy/nginx.sip-d.conf

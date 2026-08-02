@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "devDependencies": {
+    "@awesome.me/webawesome": "3.2.1"
+  }
+}
