@@ -17,7 +17,7 @@ The workflow checks out the repository, configures Go 1.23, then runs `go test .
 
 ## GitHub Secrets
 
-Required repository secrets are `DEPLOY_HOST`, `DEPLOY_USER`, and `DEPLOY_SSH_KEY`. `DEPLOY_PORT` is optional and defaults to `22`.
+Required repository secrets are `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`, and `DEPLOY_HOST_FINGERPRINT`. The fingerprint is the trusted SSH host-key fingerprint for `DEPLOY_HOST`. `DEPLOY_PORT` is optional and defaults to `22`.
 
 ## Failure Handling
 
