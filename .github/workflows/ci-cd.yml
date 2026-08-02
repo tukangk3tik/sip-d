@@ -1,0 +1,77 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build Linux AMD64 binary
+        env:
+          CGO_ENABLED: '1'
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -trimpath -ldflags='-s -w' -o dist/sip-d .
+
+      - name: Upload deployment binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sip-d-linux-amd64
+          path: dist/sip-d
+          if-no-files-found: error
+
+  deploy:
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download deployment binary
+        uses: actions/download-artifact@v4
+        with:
+          name: sip-d-linux-amd64
+
+      - name: Upload binary to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          source: sip-d
+          target: /tmp/
+
+      - name: Install and verify deployment
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            set -eu
+            sudo install -D -o root -g root -m 0755 /tmp/sip-d /opt/sip-d/sip-d.new
+            if [ -f /opt/sip-d/sip-d ]; then
+              sudo cp -p /opt/sip-d/sip-d /opt/sip-d/sip-d.previous
+            fi
+            sudo mv /opt/sip-d/sip-d.new /opt/sip-d/sip-d
+            sudo systemctl restart sip-d
+            curl --fail --retry 5 --retry-delay 2 http://127.0.0.1:8090/healthz
