@@ -63,7 +63,7 @@ type Transaction struct {
 }
 type Holding struct {
 	Asset
-	Quantity, AverageCost, CostBasisIDR, RealizedIDR, NetInvested, PriceIDR, ValueIDR, UnrealizedIDR decimal.Decimal
+	Quantity, AverageCost, CostBasisIDR, RealizedIDR, NetInvested, PriceIDR, ValueIDR, UnrealizedIDR, Percent decimal.Decimal
 }
 type Snapshot struct {
 	At    string
@@ -103,7 +103,7 @@ func NewApp(path, baseURL, metalsKey, finnhubKey, rapidKey string) (*App, error)
 		return nil, err
 	}
 	a := &App{db: db, baseURL: baseURL, metalsKey: metalsKey, finnhubKey: finnhubKey, rapidKey: rapidKey, secure: strings.HasPrefix(baseURL, "https://"), client: &http.Client{Timeout: 6 * time.Second}, attempts: map[string][]time.Time{}}
-	a.tpl, err = template.New("page").Funcs(template.FuncMap{"money": formatMoney, "amount": formatAmount, "humanTime": formatTime, "dec": func(d decimal.Decimal) string { return d.StringFixed(2) }, "pct": func(d decimal.Decimal) string { return d.StringFixed(2) + "%" }, "positive": func(d decimal.Decimal) bool { return d.IsPositive() }, "negative": func(d decimal.Decimal) bool { return d.IsNegative() }}).Parse(pageTemplate)
+	a.tpl, err = template.New("page").Funcs(template.FuncMap{"money": formatMoney, "amount": formatAmount, "humanTime": formatTime, "add1": func(i int) int { return i + 1 }, "dec": func(d decimal.Decimal) string { return d.StringFixed(2) }, "pct": func(d decimal.Decimal) string { return d.StringFixed(2) + "%" }, "positive": func(d decimal.Decimal) bool { return d.IsPositive() }, "negative": func(d decimal.Decimal) bool { return d.IsNegative() }}).Parse(pageTemplate)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -376,6 +376,11 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(p.Top, func(i, j int) bool { return p.Top[i].ValueIDR.GreaterThan(p.Top[j].ValueIDR) })
 	if len(p.Top) > 3 {
 		p.Top = p.Top[:3]
+	}
+	if p.Total.IsPositive() {
+		for i := range p.Top {
+			p.Top[i].Percent = p.Top[i].ValueIDR.Div(p.Total).Mul(decimal.NewFromInt(100))
+		}
 	}
 	if p.NetInvested.IsPositive() {
 		p.Return = p.Realized.Add(p.Unrealized).Div(p.NetInvested).Mul(decimal.NewFromInt(100))
