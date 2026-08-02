@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -107,6 +109,96 @@ func setupUser(t *testing.T, a *App, name string) int64 {
 	id, _ := res.LastInsertId()
 	a.db.Exec(`INSERT INTO user_settings(user_id) VALUES(?)`, id)
 	return id
+}
+
+func authenticatedGet(t *testing.T, a *App, uid int64, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	session := httptest.NewRecorder()
+	a.newSession(session, httptest.NewRequest("GET", "/login", nil), uid)
+	if len(session.Result().Cookies()) != 1 {
+		t.Fatal("session cookie missing")
+	}
+	req := httptest.NewRequest("GET", path, nil)
+	req.AddCookie(session.Result().Cookies()[0])
+	w := httptest.NewRecorder()
+	a.Routes().ServeHTTP(w, req)
+	return w
+}
+
+func insertSnapshot(t *testing.T, a *App, uid int64, value int, at string) {
+	t.Helper()
+	_, err := a.db.Exec(`INSERT INTO portfolio_snapshots(user_id,refresh_key,total_value_idr,net_invested_idr,realized_pl_idr,unrealized_pl_idr,created_at) VALUES(?,?,?,?,?,?,?)`, uid, "snapshot-"+strconv.Itoa(value), strconv.Itoa(value), "0", "0", "0", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDashboardHistoryLimit(t *testing.T) {
+	a := testApp(t)
+	owner := setupUser(t, a, "owner")
+	for day := 1; day <= 11; day++ {
+		insertSnapshot(t, a, owner, 1000+day, fmt.Sprintf("2026-08-%02dT12:00:00Z", day))
+	}
+
+	w := authenticatedGet(t, a, owner, "/")
+	if w.Code != http.StatusOK {
+		t.Fatalf("dashboard status %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "Rp 1.001") {
+		t.Fatal("dashboard rendered more than the ten newest snapshots")
+	}
+	for value := 1002; value <= 1011; value++ {
+		if !strings.Contains(body, "Rp "+strconv.Itoa(value/1000)+"."+fmt.Sprintf("%03d", value%1000)) {
+			t.Fatalf("dashboard missing snapshot value %d", value)
+		}
+	}
+	if !strings.Contains(body, `href="/history">View all history`) {
+		t.Fatal("dashboard history link missing")
+	}
+}
+
+func TestDashboardHistoryLinkForEmptyPortfolio(t *testing.T) {
+	a := testApp(t)
+	owner := setupUser(t, a, "owner")
+
+	w := authenticatedGet(t, a, owner, "/")
+	if w.Code != http.StatusOK {
+		t.Fatalf("dashboard status %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `href="/history">View all history`) {
+		t.Fatal("empty dashboard history link missing")
+	}
+}
+
+func TestPortfolioHistory(t *testing.T) {
+	a := testApp(t)
+	owner := setupUser(t, a, "owner")
+	other := setupUser(t, a, "other")
+	for day := 1; day <= 11; day++ {
+		insertSnapshot(t, a, owner, 1000+day, fmt.Sprintf("2026-08-%02dT12:00:00Z", day))
+	}
+	insertSnapshot(t, a, other, 9999, "2026-08-12T12:00:00Z")
+
+	w := authenticatedGet(t, a, owner, "/history")
+	if w.Code != http.StatusOK {
+		t.Fatalf("history status %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `href="/history">History`) {
+		t.Fatal("history navigation link missing")
+	}
+	if strings.Contains(body, "Rp 9.999") {
+		t.Fatal("history rendered another user's snapshot")
+	}
+	for value := 1001; value <= 1011; value++ {
+		if !strings.Contains(body, "Rp "+strconv.Itoa(value/1000)+"."+fmt.Sprintf("%03d", value%1000)) {
+			t.Fatalf("history missing snapshot value %d", value)
+		}
+	}
+	if strings.Index(body, "Rp 1.011") > strings.Index(body, "Rp 1.001") {
+		t.Fatal("history snapshots are not newest first")
+	}
 }
 
 func TestFirstUserSetupLocks(t *testing.T) {

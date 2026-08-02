@@ -127,6 +127,7 @@ func (a *App) Routes() http.Handler {
 	m.HandleFunc("POST /login", a.loginPost)
 	m.HandleFunc("POST /logout", a.auth(a.csrf(a.logout)))
 	m.HandleFunc("GET /", a.auth(a.dashboard))
+	m.HandleFunc("GET /history", a.auth(a.history))
 	m.HandleFunc("POST /refresh", a.auth(a.csrf(a.refresh)))
 	m.HandleFunc("GET /assets", a.auth(a.assets))
 	m.HandleFunc("GET /assets/new", a.auth(a.assetForm))
@@ -385,7 +386,7 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	if p.NetInvested.IsPositive() {
 		p.Return = p.Realized.Add(p.Unrealized).Div(p.NetInvested).Mul(decimal.NewFromInt(100))
 	}
-	rows, _ := a.db.Query(`SELECT created_at,total_value_idr FROM portfolio_snapshots WHERE user_id=? ORDER BY created_at DESC LIMIT 30`, u.ID)
+	rows, _ := a.db.Query(`SELECT created_at,total_value_idr FROM portfolio_snapshots WHERE user_id=? ORDER BY created_at DESC LIMIT 10`, u.ID)
 	if rows != nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -418,6 +419,40 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 		for i := range p.Snapshots {
 			p.Snapshots[i].Value = p.Snapshots[i].Value.Div(rate)
 		}
+	}
+	a.render(w, p)
+}
+
+func (a *App) history(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	_, rate, err := a.holdings(u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	p := Page{Title: "Portfolio History", View: "history", User: u, CSRF: u.CSRF, Currency: u.Currency}
+	rows, err := a.db.Query(`SELECT created_at,total_value_idr FROM portfolio_snapshots WHERE user_id=? ORDER BY created_at DESC`, u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s Snapshot
+		var value string
+		if err := rows.Scan(&s.At, &value); err != nil {
+			a.fail(w, err)
+			return
+		}
+		s.Value = mustDec(value)
+		if u.Currency == "USD" && rate.IsPositive() {
+			s.Value = s.Value.Div(rate)
+		}
+		p.Snapshots = append(p.Snapshots, s)
+	}
+	if err := rows.Err(); err != nil {
+		a.fail(w, err)
+		return
 	}
 	a.render(w, p)
 }
