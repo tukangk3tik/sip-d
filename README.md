@@ -1,6 +1,12 @@
 # SIP-D
 
-SIP-D is a lightweight, self-hosted savings and investment monitor. It is a single Go process with server-rendered HTML and SQLite.
+SIP-D is a lightweight, self-hosted application for recording and monitoring personal savings and investments in one private portfolio. It is designed for an owner who wants to keep financial records on infrastructure they control instead of relying on a hosted portfolio service.
+
+The application uses a transaction ledger as its source of truth. It turns deposits, withdrawals, purchases, and sales into current holdings, weighted-average cost, invested capital, and realized or unrealized profit and loss. A dashboard combines cash, gold, money-market instruments, Indonesian stocks, and Bitcoin, with IDR or USD reporting, allocation summaries, market-price refreshes, and point-in-time portfolio snapshots.
+
+SIP-D is a monitoring and record-keeping tool. It does not connect to brokers, execute trades, provide budgeting features, or offer financial advice. The current product is intended for one owner, while its ownership boundaries and database schema keep each user's records isolated for controlled multi-user support later.
+
+The production application runs as a single Go process with server-rendered HTML and SQLite, making it suitable for a small VPS with minimal operational overhead.
 
 ## Features
 
