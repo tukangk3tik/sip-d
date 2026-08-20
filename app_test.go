@@ -108,6 +108,9 @@ func setupUser(t *testing.T, a *App, name string) int64 {
 	}
 	id, _ := res.LastInsertId()
 	a.db.Exec(`INSERT INTO user_settings(user_id) VALUES(?)`, id)
+	if _, err := a.ensureRDNWallet(id); err != nil {
+		t.Fatal(err)
+	}
 	return id
 }
 
@@ -463,6 +466,146 @@ func TestTransactionDoesNotCreateSnapshot(t *testing.T) {
 	a.db.QueryRow(`SELECT count(*) FROM portfolio_snapshots`).Scan(&n)
 	if n != 0 {
 		t.Fatal("transaction created snapshot")
+	}
+}
+
+func createStockAsset(t *testing.T, a *App, uid int64) int64 {
+	t.Helper()
+	r, err := a.db.Exec(`INSERT INTO investment_types(user_id,name) VALUES(?,'Stocks')`, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid, _ := r.LastInsertId()
+	r, err = a.db.Exec(`INSERT INTO assets(user_id,investment_type_id,name,symbol,unit,quantity_scale,quote_currency,pricing_mode) VALUES(?,?,'Bank Central Asia','BBCA.JK','share',0,'IDR','manual')`, uid, tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aid, _ := r.LastInsertId()
+	return aid
+}
+
+func rdnAssetID(t *testing.T, a *App, uid int64) int64 {
+	t.Helper()
+	var id int64
+	if err := a.db.QueryRow(`SELECT id FROM assets WHERE user_id=? AND name='RDN'`, uid).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func rdnBalance(t *testing.T, a *App, uid int64) decimal.Decimal {
+	t.Helper()
+	aid := rdnAssetID(t, a, uid)
+	entries, err := a.ledger(uid, aid, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := CalculatePosition(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.Quantity
+}
+
+func TestRDNWalletTopUpWithdraw(t *testing.T) {
+	a := testApp(t)
+	uid := setupUser(t, a, "owner")
+	u := &User{ID: uid, CSRF: "csrf", Currency: "IDR"}
+
+	req := postForm("/wallet/top-up", url.Values{"amount": {"1000"}, "occurred_at": {"2026-08-01T09:00"}, "idempotency_key": {"rdn-topup"}}).WithContext(context.WithValue(context.Background(), userKey, u))
+	w := httptest.NewRecorder()
+	a.walletTopUp(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("top up status %d: %s", w.Code, w.Body.String())
+	}
+	req = postForm("/wallet/withdraw", url.Values{"amount": {"250"}, "occurred_at": {"2026-08-01T10:00"}, "idempotency_key": {"rdn-withdraw"}}).WithContext(context.WithValue(context.Background(), userKey, u))
+	w = httptest.NewRecorder()
+	a.walletWithdraw(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("withdraw status %d: %s", w.Code, w.Body.String())
+	}
+	if got := rdnBalance(t, a, uid); !got.Equal(decimal.NewFromInt(750)) {
+		t.Fatalf("RDN balance %s, want 750", got)
+	}
+}
+
+func TestStockBuySellMovesRDN(t *testing.T) {
+	a := testApp(t)
+	uid := setupUser(t, a, "owner")
+	aid := createStockAsset(t, a, uid)
+	u := &User{ID: uid, CSRF: "csrf", Currency: "IDR"}
+
+	a.walletTopUp(httptest.NewRecorder(), postForm("/wallet/top-up", url.Values{"amount": {"100000"}, "occurred_at": {"2026-08-01T09:00"}, "idempotency_key": {"fund-rdn"}}).WithContext(context.WithValue(context.Background(), userKey, u)))
+	req := postForm("/transactions", url.Values{"asset_id": {strconv.FormatInt(aid, 10)}, "kind": {"buy"}, "quantity": {"10"}, "price": {"5000"}, "fx_rate": {"1"}, "occurred_at": {"2026-08-01T10:00"}, "idempotency_key": {"buy-bbca"}}).WithContext(context.WithValue(context.Background(), userKey, u))
+	w := httptest.NewRecorder()
+	a.transactionSave(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("buy status %d: %s", w.Code, w.Body.String())
+	}
+	if got := rdnBalance(t, a, uid); !got.Equal(decimal.NewFromInt(50000)) {
+		t.Fatalf("RDN after buy %s, want 50000", got)
+	}
+
+	req = postForm("/transactions", url.Values{"asset_id": {strconv.FormatInt(aid, 10)}, "kind": {"sell"}, "quantity": {"2"}, "price": {"6000"}, "fx_rate": {"1"}, "occurred_at": {"2026-08-02T10:00"}, "idempotency_key": {"sell-bbca"}}).WithContext(context.WithValue(context.Background(), userKey, u))
+	w = httptest.NewRecorder()
+	a.transactionSave(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("sell status %d: %s", w.Code, w.Body.String())
+	}
+	if got := rdnBalance(t, a, uid); !got.Equal(decimal.NewFromInt(62000)) {
+		t.Fatalf("RDN after sell %s, want 62000", got)
+	}
+	var automatic int
+	a.db.QueryRow(`SELECT count(*) FROM transactions WHERE user_id=? AND asset_id=? AND notes LIKE ?`, uid, rdnAssetID(t, a, uid), rdnAutoNotePrefix+"%").Scan(&automatic)
+	if automatic != 2 {
+		t.Fatalf("automatic RDN movement count %d, want 2", automatic)
+	}
+}
+
+func TestStockBuyRejectsInsufficientRDN(t *testing.T) {
+	a := testApp(t)
+	uid := setupUser(t, a, "owner")
+	aid := createStockAsset(t, a, uid)
+	u := &User{ID: uid, CSRF: "csrf", Currency: "IDR"}
+	req := postForm("/transactions", url.Values{"asset_id": {strconv.FormatInt(aid, 10)}, "kind": {"buy"}, "quantity": {"10"}, "price": {"5000"}, "fx_rate": {"1"}, "occurred_at": {"2026-08-01T10:00"}, "idempotency_key": {"buy-without-rdn"}}).WithContext(context.WithValue(context.Background(), userKey, u))
+	w := httptest.NewRecorder()
+	a.transactionSave(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "RDN balance is insufficient") {
+		t.Fatalf("insufficient RDN response %d: %s", w.Code, w.Body.String())
+	}
+	var n int
+	a.db.QueryRow(`SELECT count(*) FROM transactions WHERE user_id=? AND asset_id=?`, uid, aid).Scan(&n)
+	if n != 0 {
+		t.Fatal("stock buy was saved despite insufficient RDN")
+	}
+}
+
+func TestDeletingStockTransactionRemovesRDNPair(t *testing.T) {
+	a := testApp(t)
+	uid := setupUser(t, a, "owner")
+	aid := createStockAsset(t, a, uid)
+	u := &User{ID: uid, CSRF: "csrf", Currency: "IDR"}
+	a.walletTopUp(httptest.NewRecorder(), postForm("/wallet/top-up", url.Values{"amount": {"100000"}, "occurred_at": {"2026-08-01T09:00"}, "idempotency_key": {"fund-delete"}}).WithContext(context.WithValue(context.Background(), userKey, u)))
+	a.transactionSave(httptest.NewRecorder(), postForm("/transactions", url.Values{"asset_id": {strconv.FormatInt(aid, 10)}, "kind": {"buy"}, "quantity": {"10"}, "price": {"5000"}, "fx_rate": {"1"}, "occurred_at": {"2026-08-01T10:00"}, "idempotency_key": {"buy-delete"}}).WithContext(context.WithValue(context.Background(), userKey, u)))
+
+	var stockTxID int64
+	if err := a.db.QueryRow(`SELECT id FROM transactions WHERE user_id=? AND asset_id=? AND idempotency_key='buy-delete'`, uid, aid).Scan(&stockTxID); err != nil {
+		t.Fatal(err)
+	}
+	req := postForm("/transactions/"+strconv.FormatInt(stockTxID, 10)+"/delete", url.Values{}).WithContext(context.WithValue(context.Background(), userKey, u))
+	req.SetPathValue("id", strconv.FormatInt(stockTxID, 10))
+	w := httptest.NewRecorder()
+	a.transactionDelete(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("delete status %d: %s", w.Code, w.Body.String())
+	}
+	if got := rdnBalance(t, a, uid); !got.Equal(decimal.NewFromInt(100000)) {
+		t.Fatalf("RDN after delete %s, want 100000", got)
+	}
+	var pairCount int
+	a.db.QueryRow(`SELECT count(*) FROM transactions WHERE user_id=? AND idempotency_key=?`, uid, rdnAutoKeyPrefix+strconv.FormatInt(stockTxID, 10)).Scan(&pairCount)
+	if pairCount != 0 {
+		t.Fatal("automatic RDN pair was not deleted")
 	}
 }
 
