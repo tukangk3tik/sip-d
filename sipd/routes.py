@@ -1,10 +1,12 @@
 import bcrypt
 from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
 
 from flask import make_response, redirect, render_template, render_template_string, request
 
 from sipd.auth import anon_token, create_session, current_user, delete_session, require_user, valid_anon_csrf, valid_user_csrf
 from sipd.db import connect
+from sipd.domain import LedgerEntry, calculate_position
 
 
 def register_routes(app):
@@ -175,3 +177,30 @@ def register_routes(app):
         finally:
             db.close()
         return redirect("/settings", 303)
+
+    @app.post("/refresh")
+    @require_user
+    def refresh():
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        user, key = current_user(), request.form.get("refresh_key", "")
+        if not key:
+            return "Missing refresh key", 400
+        db = connect(app.config["SIPD_DB"])
+        try:
+            if db.execute("SELECT 1 FROM price_refreshes WHERE user_id=? AND refresh_key=?", (user.id, key)).fetchone():
+                return redirect("/", 303)
+            total = Decimal()
+            for asset in db.execute("SELECT id,pricing_mode,quote_currency FROM assets WHERE user_id=? AND active=1", (user.id,)):
+                rows = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at,id", (user.id, asset["id"])).fetchall()
+                entries = [LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in rows]
+                if not entries:
+                    continue
+                position = calculate_position(entries)
+                price = Decimal("1") if asset["pricing_mode"] == "fixed" else Decimal()
+                total += position.quantity * price
+            db.execute("INSERT INTO price_refreshes(user_id,refresh_key,status) VALUES(?,?,?)", (user.id, key, "success"))
+            db.execute("INSERT INTO portfolio_snapshots(user_id,refresh_key,total_value_idr,net_invested_idr,realized_pl_idr,unrealized_pl_idr) VALUES(?,?,?,?,?,?)", (user.id, key, str(total), "0", "0", str(total)))
+        finally:
+            db.close()
+        return redirect("/", 303)

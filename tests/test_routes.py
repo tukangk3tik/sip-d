@@ -70,3 +70,20 @@ def test_settings_currency_update_is_owned(client, existing_session, app):
         assert db.execute("SELECT display_currency FROM user_settings WHERE user_id=1").fetchone()[0] == "USD"
     finally:
         db.close()
+
+
+def test_refresh_creates_idempotent_snapshot_for_fixed_asset(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Cash','IDR','IDR','fixed')")
+        db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,idempotency_key) VALUES(1,1,'deposit','10','1','IDR','1','2026-08-26T12:00:00Z','cash')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+    response = client.post("/refresh", data={"csrf_token": "csrf", "refresh_key": "once"})
+    assert response.status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT total_value_idr FROM portfolio_snapshots WHERE refresh_key='once'").fetchone()[0] == "10"
+    finally:
+        db.close()
