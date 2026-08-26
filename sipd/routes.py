@@ -1,4 +1,5 @@
 import bcrypt
+from decimal import Decimal, InvalidOperation
 
 from flask import make_response, redirect, render_template, render_template_string, request
 
@@ -115,3 +116,42 @@ def register_routes(app):
         finally:
             db.close()
         return (render_template_string("<h1>{{ asset.name }}</h1>", asset=asset), 200) if asset else ("Not found", 404)
+
+    @app.post("/transactions")
+    @require_user
+    def transaction_save():
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        user = current_user()
+        try:
+            asset_id = int(request.form.get("asset_id", "0"))
+            quantity, price, fx = (Decimal(request.form[key]) for key in ("quantity", "price", "fx_rate"))
+        except (ValueError, KeyError, InvalidOperation):
+            return "Invalid transaction", 400
+        if min(quantity, price, fx) <= 0 or request.form.get("kind") not in {"buy", "sell", "deposit", "withdrawal"} or not request.form.get("idempotency_key"):
+            return "Invalid transaction", 400
+        db = connect(app.config["SIPD_DB"])
+        try:
+            asset = db.execute("SELECT quote_currency FROM assets WHERE id=? AND user_id=?", (asset_id, user.id)).fetchone()
+            if not asset:
+                return "Not found", 404
+            db.execute("""INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key)
+                          VALUES(?,?,?,?,?,?,?,?,?,?)""", (user.id, asset_id, request.form["kind"], str(quantity), str(price), asset["quote_currency"], str(fx), request.form["occurred_at"].replace("T", " ") + ":00", request.form.get("notes", ""), request.form["idempotency_key"]))
+            transaction_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        except Exception as error:
+            if "UNIQUE constraint failed" in str(error):
+                return redirect("/transactions", 303)
+            raise
+        finally:
+            db.close()
+        return redirect(f"/transactions/{transaction_id}", 303)
+
+    @app.get("/transactions/<int:transaction_id>")
+    @require_user
+    def transaction_detail(transaction_id):
+        db = connect(app.config["SIPD_DB"])
+        try:
+            row = db.execute("SELECT id,kind FROM transactions WHERE id=? AND user_id=?", (transaction_id, current_user().id)).fetchone()
+        finally:
+            db.close()
+        return (render_template_string("<h1>{{ row.kind }}</h1>", row=row), 200) if row else ("Not found", 404)
