@@ -32,3 +32,13 @@ def test_login_and_logout_use_existing_session_store(client, existing_session):
     response = client.post("/logout", data={"csrf_token": token})
     assert response.status_code == 303
     assert response.headers["Location"] == "/login"
+
+
+def test_asset_form_saves_owned_asset(client, existing_session, app):
+    client.set_cookie("sipd_session", existing_session)
+    response = client.post("/assets", data={
+        "csrf_token": "csrf", "name": "Cash", "type_id": "1", "unit": "IDR",
+        "scale": "0", "quote_currency": "IDR", "pricing_mode": "fixed",
+    })
+    assert response.status_code == 303
+    assert response.headers["Location"].startswith("/assets/")

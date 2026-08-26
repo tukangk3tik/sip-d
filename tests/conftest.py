@@ -29,6 +29,7 @@ def existing_session(app):
         )
         user_id = db.execute("SELECT id FROM users WHERE username='owner'").fetchone()[0]
         db.execute("INSERT INTO user_settings(user_id) VALUES(?)", (user_id,))
+        db.execute("INSERT INTO investment_types(user_id,name) VALUES(?, 'Cash')", (user_id,))
         db.execute(
             "INSERT INTO sessions(id_hash,user_id,csrf_token,expires_at) VALUES(?,?,?,?)",
             (hashlib.sha256(token.encode()).hexdigest(), user_id, "csrf", "2099-01-01T00:00:00Z"),
