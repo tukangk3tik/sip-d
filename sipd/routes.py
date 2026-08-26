@@ -2,11 +2,12 @@ import bcrypt
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 
-from flask import make_response, redirect, render_template, render_template_string, request
+from flask import jsonify, make_response, redirect, render_template, render_template_string, request
 
 from sipd.auth import anon_token, create_session, current_user, delete_session, require_user, valid_anon_csrf, valid_user_csrf
 from sipd.db import connect
 from sipd.domain import LedgerEntry, calculate_position
+from sipd.providers import yahoo_quotes
 
 
 def register_routes(app):
@@ -204,3 +205,21 @@ def register_routes(app):
         finally:
             db.close()
         return redirect("/", 303)
+
+    @app.get("/api/assets/<int:asset_id>/price")
+    @require_user
+    def price_lookup(asset_id):
+        db = connect(app.config["SIPD_DB"])
+        try:
+            asset = db.execute("SELECT provider,provider_symbol,quote_currency FROM assets WHERE id=? AND user_id=?", (asset_id, current_user().id)).fetchone()
+        finally:
+            db.close()
+        if not asset:
+            return "Not found", 404
+        if asset["provider"] == "yahoo":
+            quotes, errors = yahoo_quotes((asset["provider_symbol"],))
+            quote = quotes.get(asset["provider_symbol"])
+            if quote:
+                return jsonify(price=str(quote.price), currency=quote.currency, source=quote.source, timestamp=quote.at.isoformat())
+            return errors.get(asset["provider_symbol"], "No automatic or manual price available"), 503
+        return "No automatic or manual price available", 503

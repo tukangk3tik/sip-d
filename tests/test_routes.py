@@ -1,6 +1,9 @@
 import re
+from datetime import datetime, timezone
+from decimal import Decimal
 
 from sipd.db import connect
+from sipd.providers import Quote
 
 
 def test_first_user_setup_creates_session(client):
@@ -87,3 +90,17 @@ def test_refresh_creates_idempotent_snapshot_for_fixed_asset(client, existing_se
         assert db.execute("SELECT total_value_idr FROM portfolio_snapshots WHERE refresh_key='once'").fetchone()[0] == "10"
     finally:
         db.close()
+
+
+def test_price_lookup_uses_yfinance_quote(client, existing_session, app, monkeypatch):
+    from sipd import routes
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,provider,provider_symbol) VALUES(1,1,'BBRI','share','IDR','automatic','yahoo','BBRI.JK')")
+    finally:
+        db.close()
+    monkeypatch.setattr(routes, "yahoo_quotes", lambda symbols: ({"BBRI.JK": Quote(Decimal("4200"), "IDR", "Yahoo Finance (yfinance)", datetime.now(timezone.utc))}, {}))
+    client.set_cookie("sipd_session", existing_session)
+    response = client.get("/api/assets/1/price")
+    assert response.status_code == 200
+    assert response.get_json()["price"] == "4200"
