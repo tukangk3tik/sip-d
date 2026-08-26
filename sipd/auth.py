@@ -66,6 +66,21 @@ def valid_anon_csrf() -> bool:
     return hmac.compare_digest(request.form.get("csrf_token", ""), request.cookies.get("sipd_csrf", ""))
 
 
+def valid_user_csrf() -> bool:
+    user = current_user()
+    return bool(user and hmac.compare_digest(request.form.get("csrf_token", ""), user.csrf))
+
+
+def delete_session():
+    token = request.cookies.get("sipd_session")
+    if token:
+        db = connect(current_app.config["SIPD_DB"])
+        try:
+            db.execute("DELETE FROM sessions WHERE id_hash=?", (session_hash(token),))
+        finally:
+            db.close()
+
+
 def create_session(user_id: int):
     token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
     db = connect(current_app.config["SIPD_DB"])

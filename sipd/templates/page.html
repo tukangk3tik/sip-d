@@ -1,2 +1,3 @@
 <!doctype html><title>SIP-D</title>
 {% if view == 'setup' %}<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input name="username"><input name="password" type="password"><button>Setup</button></form>{% endif %}
+{% if view == 'login' %}<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf }}"><input name="username"><input name="password" type="password"><button>Login</button></form>{% endif %}
