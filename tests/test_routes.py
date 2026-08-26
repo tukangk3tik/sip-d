@@ -59,3 +59,14 @@ def test_transaction_saves_for_owned_asset(client, existing_session, app):
     })
     assert response.status_code == 303
     assert response.headers["Location"].startswith("/transactions/")
+
+
+def test_settings_currency_update_is_owned(client, existing_session, app):
+    client.set_cookie("sipd_session", existing_session)
+    response = client.post("/settings/currency", data={"csrf_token": "csrf", "currency": "USD"})
+    assert response.status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT display_currency FROM user_settings WHERE user_id=1").fetchone()[0] == "USD"
+    finally:
+        db.close()

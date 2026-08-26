@@ -155,3 +155,23 @@ def register_routes(app):
         finally:
             db.close()
         return (render_template_string("<h1>{{ row.kind }}</h1>", row=row), 200) if row else ("Not found", 404)
+
+    @app.get("/settings")
+    @require_user
+    def settings():
+        return render_template_string("<h1>Settings</h1>")
+
+    @app.post("/settings/currency")
+    @require_user
+    def currency_save():
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        currency = request.form.get("currency")
+        if currency not in {"IDR", "USD"}:
+            return "Invalid currency", 400
+        db = connect(app.config["SIPD_DB"])
+        try:
+            db.execute("UPDATE user_settings SET display_currency=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (currency, current_user().id))
+        finally:
+            db.close()
+        return redirect("/settings", 303)
