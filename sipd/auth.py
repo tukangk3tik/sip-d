@@ -1,4 +1,6 @@
 import hashlib
+import hmac
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
@@ -16,6 +18,10 @@ class User:
     currency: str
 
 
+def session_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def current_user() -> User | None:
     if "user" in g:
         return g.user
@@ -29,7 +35,7 @@ def current_user() -> User | None:
             """SELECT u.id,u.username,s.csrf_token,us.display_currency,s.expires_at
                FROM sessions s JOIN users u ON u.id=s.user_id
                JOIN user_settings us ON us.user_id=u.id WHERE s.id_hash=?""",
-            (hashlib.sha256(token.encode()).hexdigest(),),
+            (session_hash(token),),
         ).fetchone()
     finally:
         db.close()
@@ -47,6 +53,27 @@ def require_user(view):
             return redirect("/login")
         return view(*args, **kwargs)
     return wrapped
+
+
+def anon_token(response):
+    token = request.cookies.get("sipd_csrf") or secrets.token_urlsafe(24)
+    if not request.cookies.get("sipd_csrf"):
+        response.set_cookie("sipd_csrf", token, httponly=True, samesite="Lax", secure=current_app.config["SIPD_BASE_URL"].startswith("https://"))
+    return token
+
+
+def valid_anon_csrf() -> bool:
+    return hmac.compare_digest(request.form.get("csrf_token", ""), request.cookies.get("sipd_csrf", ""))
+
+
+def create_session(user_id: int):
+    token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
+    db = connect(current_app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO sessions(id_hash,user_id,csrf_token,expires_at) VALUES(?,?,?,?)", (session_hash(token), user_id, csrf, "2099-01-01T00:00:00Z"))
+    finally:
+        db.close()
+    return token
 
 
 def security_headers(response):
