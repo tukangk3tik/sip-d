@@ -106,6 +106,18 @@ def test_price_lookup_uses_yfinance_quote(client, existing_session, app, monkeyp
     assert response.get_json()["price"] == "4200"
 
 
+def test_price_lookup_uses_kraken_quote(client, existing_session, app, monkeypatch):
+    from sipd import routes
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,provider,provider_symbol) VALUES(1,1,'BTC','BTC','USD','automatic','kraken','BTC')")
+    finally:
+        db.close()
+    monkeypatch.setattr(routes, "quote_for_asset", lambda asset, **kwargs: Quote(Decimal("68000"), "USD", "Kraken", datetime.now(timezone.utc)))
+    client.set_cookie("sipd_session", existing_session)
+    assert client.get("/api/assets/1/price").get_json()["price"] == "68000"
+
+
 def test_price_lookup_uses_last_known_price_when_yfinance_fails(client, existing_session, app, monkeypatch):
     from sipd import routes
     db = connect(app.config["SIPD_DB"])
@@ -136,3 +148,17 @@ def test_refresh_saves_batched_yahoo_price(client, existing_session, app, monkey
         assert db.execute("SELECT price FROM asset_prices WHERE asset_id=1").fetchone()[0] == "4200"
     finally:
         db.close()
+
+
+def test_exchange_rate_uses_last_known_rate_when_provider_fails(client, existing_session, app, monkeypatch):
+    from sipd import routes
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO exchange_rates(user_id,base_currency,quote_currency,rate,source,priced_at) VALUES(1,'USD','IDR','16500','Frankfurter','2026-08-26T12:00:00Z')")
+    finally:
+        db.close()
+    monkeypatch.setattr(routes, "usd_idr_quote", lambda: (_ for _ in ()).throw(ValueError("provider HTTP 429")))
+    client.set_cookie("sipd_session", existing_session)
+    response = client.get("/api/exchange-rate")
+    assert response.status_code == 200
+    assert response.get_json()["source"] == "Frankfurter (last known)"

@@ -7,7 +7,7 @@ from flask import jsonify, make_response, redirect, render_template, render_temp
 from sipd.auth import anon_token, create_session, current_user, delete_session, require_user, valid_anon_csrf, valid_user_csrf
 from sipd.db import connect
 from sipd.domain import LedgerEntry, calculate_position
-from sipd.providers import yahoo_quotes
+from sipd.providers import quote_for_asset, usd_idr_quote, yahoo_quotes
 
 
 def register_routes(app):
@@ -191,10 +191,15 @@ def register_routes(app):
         try:
             if db.execute("SELECT 1 FROM price_refreshes WHERE user_id=? AND refresh_key=?", (user.id, key)).fetchone():
                 return redirect("/", 303)
-            assets = db.execute("SELECT id,name,pricing_mode,quote_currency,provider,provider_symbol FROM assets WHERE user_id=? AND active=1", (user.id,)).fetchall()
+            assets = db.execute("SELECT id,name,unit,pricing_mode,quote_currency,provider,provider_symbol FROM assets WHERE user_id=? AND active=1", (user.id,)).fetchall()
             yahoo_assets = [asset for asset in assets if asset["pricing_mode"] == "automatic" and asset["provider"] == "yahoo"]
             quotes, provider_errors = yahoo_quotes(tuple(asset["provider_symbol"] for asset in yahoo_assets)) if yahoo_assets else ({}, {})
             errors = []
+            try:
+                rate = usd_idr_quote()
+                db.execute("INSERT INTO exchange_rates(user_id,base_currency,quote_currency,rate,source,priced_at) VALUES(?,'USD','IDR',?,?,?)", (user.id, str(rate.price), rate.source, rate.at.isoformat().replace("+00:00", "Z")))
+            except ValueError as error:
+                errors.append(f"USD/IDR: {error}")
             for asset in yahoo_assets:
                 quote = quotes.get(asset["provider_symbol"])
                 if not quote:
@@ -205,8 +210,15 @@ def register_routes(app):
                     continue
                 db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset["id"], str(quote.price), quote.currency, quote.source, quote.at.isoformat().replace("+00:00", "Z")))
             for asset in assets:
-                if asset["pricing_mode"] == "automatic" and asset["provider"] != "yahoo":
-                    errors.append(f"{asset['name']}: automatic provider unavailable")
+                if asset["pricing_mode"] != "automatic" or asset["provider"] == "yahoo":
+                    continue
+                try:
+                    quote = quote_for_asset(asset, metals_key=app.config["SIPD_METALS_API_KEY"], finnhub_key=app.config["SIPD_FINNHUB_API_KEY"])
+                    if quote.price <= 0 or quote.currency != asset["quote_currency"]:
+                        raise ValueError("provider returned invalid price")
+                    db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset["id"], str(quote.price), quote.currency, quote.source, quote.at.isoformat().replace("+00:00", "Z")))
+                except ValueError as error:
+                    errors.append(f"{asset['name']}: {error}")
 
             total = net_invested = realized = unrealized = Decimal()
             db.execute("BEGIN IMMEDIATE")
@@ -218,6 +230,9 @@ def register_routes(app):
                 position = calculate_position(entries)
                 latest = db.execute("SELECT price FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (user.id, asset["id"])).fetchone()
                 price = Decimal("1") if asset["pricing_mode"] == "fixed" else Decimal(latest["price"]) if latest else Decimal()
+                if asset["quote_currency"] == "USD":
+                    latest_rate = db.execute("SELECT rate FROM exchange_rates WHERE user_id=? AND base_currency='USD' AND quote_currency='IDR' ORDER BY priced_at DESC LIMIT 1", (user.id,)).fetchone()
+                    price *= Decimal(latest_rate["rate"]) if latest_rate else Decimal()
                 value = position.quantity * price
                 total += value
                 net_invested += position.net_invested
@@ -236,7 +251,7 @@ def register_routes(app):
     def price_lookup(asset_id):
         db = connect(app.config["SIPD_DB"])
         try:
-            asset = db.execute("SELECT pricing_mode,provider,provider_symbol,quote_currency FROM assets WHERE id=? AND user_id=?", (asset_id, current_user().id)).fetchone()
+            asset = db.execute("SELECT pricing_mode,provider,provider_symbol,quote_currency,unit FROM assets WHERE id=? AND user_id=?", (asset_id, current_user().id)).fetchone()
         finally:
             db.close()
         if not asset:
@@ -248,6 +263,13 @@ def register_routes(app):
             quote = quotes.get(asset["provider_symbol"])
             if quote:
                 return jsonify(price=str(quote.price), currency=quote.currency, source=quote.source, timestamp=quote.at.isoformat())
+        else:
+            try:
+                quote = quote_for_asset(asset, metals_key=app.config["SIPD_METALS_API_KEY"], finnhub_key=app.config["SIPD_FINNHUB_API_KEY"])
+                if quote.price > 0 and quote.currency == asset["quote_currency"]:
+                    return jsonify(price=str(quote.price), currency=quote.currency, source=quote.source, timestamp=quote.at.isoformat().replace("+00:00", "Z"))
+            except ValueError:
+                pass
         db = connect(app.config["SIPD_DB"])
         try:
             last = db.execute("SELECT price,currency,source,priced_at FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (current_user().id, asset_id)).fetchone()
@@ -256,3 +278,19 @@ def register_routes(app):
         if last:
             return jsonify(price=last["price"], currency=last["currency"], source=last["source"] + " (last known)", timestamp=last["priced_at"])
         return "No automatic or manual price available", 503
+
+    @app.get("/api/exchange-rate")
+    @require_user
+    def exchange_rate_lookup():
+        try:
+            quote = usd_idr_quote()
+        except ValueError:
+            db = connect(app.config["SIPD_DB"])
+            try:
+                last = db.execute("SELECT rate,source,priced_at FROM exchange_rates WHERE user_id=? AND base_currency='USD' AND quote_currency='IDR' ORDER BY priced_at DESC LIMIT 1", (current_user().id,)).fetchone()
+            finally:
+                db.close()
+            if last:
+                return jsonify(rate=last["rate"], source=last["source"] + " (last known)", timestamp=last["priced_at"])
+            return "USD/IDR rate unavailable", 503
+        return jsonify(rate=str(quote.price), source=quote.source, timestamp=quote.at.isoformat().replace("+00:00", "Z"))

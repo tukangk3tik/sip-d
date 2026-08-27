@@ -12,6 +12,8 @@ def create_app(config: dict | None = None) -> Flask:
     app.config.from_mapping(
         SIPD_DB=os.environ.get("SIPD_DB", "data/sip-d.db"),
         SIPD_BASE_URL=os.environ.get("SIPD_BASE_URL", ""),
+        SIPD_METALS_API_KEY=os.environ.get("SIPD_METALS_API_KEY", ""),
+        SIPD_FINNHUB_API_KEY=os.environ.get("SIPD_FINNHUB_API_KEY", ""),
     )
     app.config.from_mapping(config or {})
     init_db(app.config["SIPD_DB"])
