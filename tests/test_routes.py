@@ -80,6 +80,18 @@ def test_transaction_saves_for_owned_asset(client, existing_session, app):
     assert response.headers["Location"].startswith("/transactions/")
 
 
+def test_second_transaction_replays_existing_utc_ledger(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Cash','IDR','IDR','fixed')")
+        db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,idempotency_key) VALUES(1,1,'deposit','1','1','IDR','1','2026-08-26T12:00:00Z','first')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+    response = client.post("/transactions", data={"csrf_token": "csrf", "asset_id": "1", "kind": "deposit", "quantity": "1", "price": "1", "fx_rate": "1", "occurred_at": "2026-08-27T12:00", "idempotency_key": "second"})
+    assert response.status_code == 303
+
+
 def test_settings_currency_update_is_owned(client, existing_session, app):
     client.set_cookie("sipd_session", existing_session)
     response = client.post("/settings/currency", data={"csrf_token": "csrf", "currency": "USD"})
@@ -118,6 +130,7 @@ def test_refresh_creates_idempotent_snapshot_for_fixed_asset(client, existing_se
     db = connect(app.config["SIPD_DB"])
     try:
         assert db.execute("SELECT total_value_idr FROM portfolio_snapshots WHERE refresh_key='once'").fetchone()[0] == "10"
+        assert db.execute("SELECT quantity,price FROM portfolio_snapshot_items").fetchone()[0] == "10"
     finally:
         db.close()
 

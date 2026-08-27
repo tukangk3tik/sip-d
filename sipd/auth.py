@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from flask import current_app, g, redirect, request
@@ -83,9 +83,11 @@ def delete_session():
 
 def create_session(user_id: int):
     token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
+    expires_at = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
     db = connect(current_app.config["SIPD_DB"])
     try:
-        db.execute("INSERT INTO sessions(id_hash,user_id,csrf_token,expires_at) VALUES(?,?,?,?)", (session_hash(token), user_id, csrf, "2099-01-01T00:00:00Z"))
+        db.execute("DELETE FROM sessions WHERE expires_at<?", (datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),))
+        db.execute("INSERT INTO sessions(id_hash,user_id,csrf_token,expires_at) VALUES(?,?,?,?)", (session_hash(token), user_id, csrf, expires_at))
     finally:
         db.close()
     return token

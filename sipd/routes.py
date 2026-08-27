@@ -1,5 +1,6 @@
 import bcrypt
 import secrets
+import time
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 
@@ -17,6 +18,16 @@ def user_page(view, title, **context):
 
 
 def register_routes(app):
+    def allow_login():
+        attempts = app.extensions.setdefault("sipd_login_attempts", {})
+        ip, cutoff = request.remote_addr or "", time.monotonic() - 900
+        recent = [at for at in attempts.get(ip, []) if at > cutoff]
+        if len(recent) >= 10:
+            attempts[ip] = recent
+            return False
+        attempts[ip] = recent + [time.monotonic()]
+        return True
+
     @app.route("/setup", methods=["GET", "POST"])
     def setup():
         db = connect(app.config["SIPD_DB"])
@@ -62,6 +73,8 @@ def register_routes(app):
         if request.method == "POST":
             if not valid_anon_csrf():
                 return "Invalid CSRF token", 403
+            if not allow_login():
+                return "Too many login attempts. Try again later.", 429
             db = connect(app.config["SIPD_DB"])
             try:
                 row = db.execute("SELECT id,password_hash FROM users WHERE username=? COLLATE NOCASE", (request.form.get("username", "").strip(),)).fetchone()
@@ -174,6 +187,7 @@ def register_routes(app):
         try:
             asset_id = int(request.form.get("asset_id", "0"))
             quantity, price, fx = (Decimal(request.form[key]) for key in ("quantity", "price", "fx_rate"))
+            occurred_at = datetime.fromisoformat(request.form["occurred_at"]).replace(tzinfo=timezone.utc)
         except (ValueError, KeyError, InvalidOperation):
             return "Invalid transaction", 400
         if min(quantity, price, fx) <= 0 or request.form.get("kind") not in {"buy", "sell", "deposit", "withdrawal"} or not request.form.get("idempotency_key"):
@@ -188,13 +202,13 @@ def register_routes(app):
             existing = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at,id", (user.id, asset_id)).fetchall()
             entries = [LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in existing]
             try:
-                calculate_position(entries + [LedgerEntry(0, request.form["kind"], quantity, price, fx, datetime.fromisoformat(request.form["occurred_at"]))])
+                calculate_position(entries + [LedgerEntry(0, request.form["kind"], quantity, price, fx, occurred_at)])
             except ValueError as error:
                 return str(error), 400
             db.execute("""INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key)
-                          VALUES(?,?,?,?,?,?,?,?,?,?)""", (user.id, asset_id, request.form["kind"], str(quantity), str(price), asset["quote_currency"], str(fx), request.form["occurred_at"] + ":00Z", request.form.get("notes", "").strip(), request.form["idempotency_key"]))
+                          VALUES(?,?,?,?,?,?,?,?,?,?)""", (user.id, asset_id, request.form["kind"], str(quantity), str(price), asset["quote_currency"], str(fx), occurred_at.isoformat().replace("+00:00", "Z"), request.form.get("notes", "").strip(), request.form["idempotency_key"]))
             transaction_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset_id, str(price), asset["quote_currency"], "Transaction", request.form["occurred_at"] + ":00Z"))
+            db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset_id, str(price), asset["quote_currency"], "Transaction", occurred_at.isoformat().replace("+00:00", "Z")))
         except Exception as error:
             if "UNIQUE constraint failed" in str(error):
                 return redirect("/transactions", 303)
@@ -367,6 +381,7 @@ def register_routes(app):
                     errors.append(f"{asset['name']}: {error}")
 
             total = net_invested = realized = unrealized = Decimal()
+            snapshot_items = []
             db.execute("BEGIN IMMEDIATE")
             for asset in assets:
                 rows = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at,id", (user.id, asset["id"])).fetchall()
@@ -376,17 +391,22 @@ def register_routes(app):
                 position = calculate_position(entries)
                 latest = db.execute("SELECT price FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (user.id, asset["id"])).fetchone()
                 price = Decimal("1") if asset["pricing_mode"] == "fixed" else Decimal(latest["price"]) if latest else Decimal()
+                fx_rate = Decimal("1")
                 if asset["quote_currency"] == "USD":
                     latest_rate = db.execute("SELECT rate FROM exchange_rates WHERE user_id=? AND base_currency='USD' AND quote_currency='IDR' ORDER BY priced_at DESC LIMIT 1", (user.id,)).fetchone()
-                    price *= Decimal(latest_rate["rate"]) if latest_rate else Decimal()
-                value = position.quantity * price
+                    fx_rate = Decimal(latest_rate["rate"]) if latest_rate else Decimal()
+                value = position.quantity * price * fx_rate
                 total += value
                 net_invested += position.net_invested
                 realized += position.realized
                 unrealized += value - position.cost_basis
+                snapshot_items.append((asset, position, price, fx_rate, value))
             status = "partial" if errors else "success"
             db.execute("INSERT INTO price_refreshes(user_id,refresh_key,status,error_summary) VALUES(?,?,?,?)", (user.id, key, status, "; ".join(errors)))
             db.execute("INSERT INTO portfolio_snapshots(user_id,refresh_key,total_value_idr,net_invested_idr,realized_pl_idr,unrealized_pl_idr) VALUES(?,?,?,?,?,?)", (user.id, key, str(total), str(net_invested), str(realized), str(unrealized)))
+            snapshot_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            for asset, position, price, fx_rate, value in snapshot_items:
+                db.execute("INSERT INTO portfolio_snapshot_items(snapshot_id,user_id,asset_id,quantity,average_cost,price,quote_currency,fx_rate_to_idr,market_value_idr,cost_basis_idr,realized_pl_idr) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (snapshot_id, user.id, asset["id"], str(position.quantity), str(position.average_cost), str(price), asset["quote_currency"], str(fx_rate), str(value), str(position.cost_basis), str(position.realized)))
             db.commit()
         finally:
             db.close()
