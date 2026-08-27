@@ -104,3 +104,35 @@ def test_price_lookup_uses_yfinance_quote(client, existing_session, app, monkeyp
     response = client.get("/api/assets/1/price")
     assert response.status_code == 200
     assert response.get_json()["price"] == "4200"
+
+
+def test_price_lookup_uses_last_known_price_when_yfinance_fails(client, existing_session, app, monkeypatch):
+    from sipd import routes
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,provider,provider_symbol) VALUES(1,1,'BBRI','share','IDR','automatic','yahoo','BBRI.JK')")
+        db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(1,1,'4100','IDR','Yahoo Finance (yfinance)','2026-08-26T12:00:00Z')")
+    finally:
+        db.close()
+    monkeypatch.setattr(routes, "yahoo_quotes", lambda symbols: ({}, {"BBRI.JK": "Provider unavailable"}))
+    client.set_cookie("sipd_session", existing_session)
+    response = client.get("/api/assets/1/price")
+    assert response.status_code == 200
+    assert response.get_json()["source"] == "Yahoo Finance (yfinance) (last known)"
+
+
+def test_refresh_saves_batched_yahoo_price(client, existing_session, app, monkeypatch):
+    from sipd import routes
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,provider,provider_symbol) VALUES(1,1,'BBRI','share','IDR','automatic','yahoo','BBRI.JK')")
+    finally:
+        db.close()
+    monkeypatch.setattr(routes, "yahoo_quotes", lambda symbols: ({"BBRI.JK": Quote(Decimal("4200"), "IDR", "Yahoo Finance (yfinance)", datetime.now(timezone.utc))}, {}))
+    client.set_cookie("sipd_session", existing_session)
+    assert client.post("/refresh", data={"csrf_token": "csrf", "refresh_key": "yahoo"}).status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT price FROM asset_prices WHERE asset_id=1").fetchone()[0] == "4200"
+    finally:
+        db.close()

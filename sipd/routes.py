@@ -191,17 +191,42 @@ def register_routes(app):
         try:
             if db.execute("SELECT 1 FROM price_refreshes WHERE user_id=? AND refresh_key=?", (user.id, key)).fetchone():
                 return redirect("/", 303)
-            total = Decimal()
-            for asset in db.execute("SELECT id,pricing_mode,quote_currency FROM assets WHERE user_id=? AND active=1", (user.id,)):
+            assets = db.execute("SELECT id,name,pricing_mode,quote_currency,provider,provider_symbol FROM assets WHERE user_id=? AND active=1", (user.id,)).fetchall()
+            yahoo_assets = [asset for asset in assets if asset["pricing_mode"] == "automatic" and asset["provider"] == "yahoo"]
+            quotes, provider_errors = yahoo_quotes(tuple(asset["provider_symbol"] for asset in yahoo_assets)) if yahoo_assets else ({}, {})
+            errors = []
+            for asset in yahoo_assets:
+                quote = quotes.get(asset["provider_symbol"])
+                if not quote:
+                    errors.append(f"{asset['name']}: {provider_errors.get(asset['provider_symbol'], 'provider unavailable')}")
+                    continue
+                if quote.price <= 0 or quote.currency != asset["quote_currency"]:
+                    errors.append(f"{asset['name']}: provider returned invalid price")
+                    continue
+                db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset["id"], str(quote.price), quote.currency, quote.source, quote.at.isoformat().replace("+00:00", "Z")))
+            for asset in assets:
+                if asset["pricing_mode"] == "automatic" and asset["provider"] != "yahoo":
+                    errors.append(f"{asset['name']}: automatic provider unavailable")
+
+            total = net_invested = realized = unrealized = Decimal()
+            db.execute("BEGIN IMMEDIATE")
+            for asset in assets:
                 rows = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at,id", (user.id, asset["id"])).fetchall()
                 entries = [LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in rows]
                 if not entries:
                     continue
                 position = calculate_position(entries)
-                price = Decimal("1") if asset["pricing_mode"] == "fixed" else Decimal()
-                total += position.quantity * price
-            db.execute("INSERT INTO price_refreshes(user_id,refresh_key,status) VALUES(?,?,?)", (user.id, key, "success"))
-            db.execute("INSERT INTO portfolio_snapshots(user_id,refresh_key,total_value_idr,net_invested_idr,realized_pl_idr,unrealized_pl_idr) VALUES(?,?,?,?,?,?)", (user.id, key, str(total), "0", "0", str(total)))
+                latest = db.execute("SELECT price FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (user.id, asset["id"])).fetchone()
+                price = Decimal("1") if asset["pricing_mode"] == "fixed" else Decimal(latest["price"]) if latest else Decimal()
+                value = position.quantity * price
+                total += value
+                net_invested += position.net_invested
+                realized += position.realized
+                unrealized += value - position.cost_basis
+            status = "partial" if errors else "success"
+            db.execute("INSERT INTO price_refreshes(user_id,refresh_key,status,error_summary) VALUES(?,?,?,?)", (user.id, key, status, "; ".join(errors)))
+            db.execute("INSERT INTO portfolio_snapshots(user_id,refresh_key,total_value_idr,net_invested_idr,realized_pl_idr,unrealized_pl_idr) VALUES(?,?,?,?,?,?)", (user.id, key, str(total), str(net_invested), str(realized), str(unrealized)))
+            db.commit()
         finally:
             db.close()
         return redirect("/", 303)
@@ -211,15 +236,23 @@ def register_routes(app):
     def price_lookup(asset_id):
         db = connect(app.config["SIPD_DB"])
         try:
-            asset = db.execute("SELECT provider,provider_symbol,quote_currency FROM assets WHERE id=? AND user_id=?", (asset_id, current_user().id)).fetchone()
+            asset = db.execute("SELECT pricing_mode,provider,provider_symbol,quote_currency FROM assets WHERE id=? AND user_id=?", (asset_id, current_user().id)).fetchone()
         finally:
             db.close()
         if not asset:
             return "Not found", 404
+        if asset["pricing_mode"] == "fixed":
+            return jsonify(price="1", currency=asset["quote_currency"], source="Fixed", timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
         if asset["provider"] == "yahoo":
             quotes, errors = yahoo_quotes((asset["provider_symbol"],))
             quote = quotes.get(asset["provider_symbol"])
             if quote:
                 return jsonify(price=str(quote.price), currency=quote.currency, source=quote.source, timestamp=quote.at.isoformat())
-            return errors.get(asset["provider_symbol"], "No automatic or manual price available"), 503
+        db = connect(app.config["SIPD_DB"])
+        try:
+            last = db.execute("SELECT price,currency,source,priced_at FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (current_user().id, asset_id)).fetchone()
+        finally:
+            db.close()
+        if last:
+            return jsonify(price=last["price"], currency=last["currency"], source=last["source"] + " (last known)", timestamp=last["priced_at"])
         return "No automatic or manual price available", 503
