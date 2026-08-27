@@ -6,7 +6,7 @@ The application uses a transaction ledger as its source of truth. It turns depos
 
 SIP-D is a monitoring and record-keeping tool. It does not connect to brokers, execute trades, provide budgeting features, or offer financial advice. The current product is intended for one owner, while its ownership boundaries and database schema keep each user's records isolated for controlled multi-user support later.
 
-The production application runs as a single Go process with server-rendered HTML and SQLite, making it suitable for a small VPS with minimal operational overhead.
+The Flask application runs as a single Gunicorn process with server-rendered HTML and SQLite, making it suitable for a small VPS with minimal operational overhead. The Go binary remains available for rollback during cutover.
 
 ## Features
 
@@ -21,13 +21,13 @@ The production application runs as a single Go process with server-rendered HTML
 
 ## Local development
 
-Requirements: Go 1.23+, GCC, and SQLite development headers.
+Requirements: Python 3.12+.
 
 ```sh
-cp .env.example .env
-npm install
-go test ./...
-go run .
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pytest -q
+SIPD_DB=data/sip-d.db .venv/bin/gunicorn --bind 127.0.0.1:8090 sipd.wsgi:app
 ```
 
 The pinned Web Awesome package is the development source for the vendored, embedded assets under `static/webawesome`. Production does not run Node.js.
@@ -67,7 +67,24 @@ Deleting an erroneous transaction is allowed only when replaying the remaining l
 
 Provider calls have a six-second timeout and one limited retry. A failed refresh never overwrites the last valid price. Successful assets are retained and failures are shown per asset.
 
-## Production deployment
+## Flask cutover
+
+Back up the existing SQLite database, install the Python app and virtual environment in `/opt/sip-d`, then install `deploy/sip-d-python.service` as `/etc/systemd/system/sip-d-python.service`.
+
+```sh
+sudo -u sip-d sqlite3 /var/lib/sip-d/sip-d.db ".backup '/var/lib/sip-d/pre-flask-cutover.db'"
+sudo -u sip-d python3 -m venv /opt/sip-d/venv
+sudo -u sip-d /opt/sip-d/venv/bin/pip install -r /opt/sip-d/requirements.txt
+sudo install -o root -g root -m 0644 deploy/sip-d-python.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl stop sip-d
+sudo systemctl enable --now sip-d-python
+curl --fail http://127.0.0.1:8090/healthz
+```
+
+Log in and run one Refresh Prices smoke check before changing the reverse proxy. To roll back, stop `sip-d-python`, start `sip-d`, and restore the backup only if data was changed incompatibly.
+
+## Legacy Go deployment
 
 Build and install:
 
