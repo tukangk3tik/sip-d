@@ -46,7 +46,23 @@ def test_asset_form_saves_owned_asset(client, existing_session, app):
         "scale": "0", "quote_currency": "IDR", "pricing_mode": "fixed",
     })
     assert response.status_code == 303
-    assert response.headers["Location"].startswith("/assets/")
+    assert response.headers["Location"] == "/assets"
+
+
+def test_asset_edit_and_archive_routes(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Cash','IDR','IDR','fixed')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+    assert client.get("/assets/1/edit").status_code == 200
+    assert client.post("/assets/1/archive", data={"csrf_token": "csrf"}).status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT active FROM assets WHERE id=1").fetchone()[0] == 0
+    finally:
+        db.close()
 
 
 def test_transaction_saves_for_owned_asset(client, existing_session, app):
@@ -73,6 +89,20 @@ def test_settings_currency_update_is_owned(client, existing_session, app):
         assert db.execute("SELECT display_currency FROM user_settings WHERE user_id=1").fetchone()[0] == "USD"
     finally:
         db.close()
+
+
+def test_dashboard_renders_jinja_navigation(client, existing_session):
+    client.set_cookie("sipd_session", existing_session)
+    page = client.get("/")
+    assert page.status_code == 200
+    assert 'href="/transactions"' in page.text
+
+
+def test_ticker_lookup_route_and_static_assets(client, existing_session):
+    client.set_cookie("sipd_session", existing_session)
+    assert client.get("/settings/tickers").status_code == 200
+    assert client.get("/static/app.css").status_code == 200
+    assert client.get("/static/webawesome/styles/webawesome.css").status_code == 200
 
 
 def test_refresh_creates_idempotent_snapshot_for_fixed_asset(client, existing_session, app):

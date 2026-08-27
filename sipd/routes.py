@@ -1,4 +1,5 @@
 import bcrypt
+import secrets
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 
@@ -8,6 +9,11 @@ from sipd.auth import anon_token, create_session, current_user, delete_session, 
 from sipd.db import connect
 from sipd.domain import LedgerEntry, calculate_position
 from sipd.providers import quote_for_asset, usd_idr_quote, yahoo_quotes
+
+
+def user_page(view, title, **context):
+    user = current_user()
+    return render_template("page.html", view=view, title=title, user=user, csrf=user.csrf, currency=user.currency, **context)
 
 
 def register_routes(app):
@@ -43,7 +49,13 @@ def register_routes(app):
     @app.get("/")
     @require_user
     def dashboard():
-        return render_template_string('<h1>SIP-D</h1><p data-csrf="{{ user.csrf }}">{{ user.username }}</p>', user=current_user())
+        db = connect(app.config["SIPD_DB"])
+        try:
+            assets = db.execute("SELECT a.id,a.name,a.unit,a.quote_currency,a.pricing_mode,COALESCE((SELECT price FROM asset_prices p WHERE p.user_id=a.user_id AND p.asset_id=a.id ORDER BY priced_at DESC LIMIT 1),'') price FROM assets a WHERE a.user_id=? AND a.active=1 ORDER BY a.name", (current_user().id,)).fetchall()
+            snapshots = db.execute("SELECT created_at,total_value_idr FROM portfolio_snapshots WHERE user_id=? ORDER BY id DESC LIMIT 10", (current_user().id,)).fetchall()
+        finally:
+            db.close()
+        return user_page("dashboard", "Dashboard", assets=assets, snapshots=snapshots, refresh_key=secrets.token_urlsafe(18))
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
@@ -81,14 +93,29 @@ def register_routes(app):
     def assets():
         db = connect(app.config["SIPD_DB"])
         try:
-            rows = db.execute("SELECT id,name FROM assets WHERE user_id=? ORDER BY name", (current_user().id,)).fetchall()
+            rows = db.execute("SELECT a.*,t.name type_name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.user_id=? ORDER BY a.active DESC,t.name,a.name", (current_user().id,)).fetchall()
         finally:
             db.close()
-        return render_template_string("<h1>Assets</h1>{% for asset in assets %}<a href='/assets/{{ asset.id }}'>{{ asset.name }}</a>{% endfor %}", assets=rows)
+        return user_page("assets", "Assets", assets=rows)
 
-    @app.route("/assets", methods=["POST"])
+    @app.get("/assets/new")
+    @app.get("/assets/<int:asset_id>/edit")
     @require_user
-    def asset_save():
+    def asset_form(asset_id=None):
+        db = connect(app.config["SIPD_DB"])
+        try:
+            types = db.execute("SELECT id,name FROM investment_types WHERE user_id=? AND active=1 ORDER BY name", (current_user().id,)).fetchall()
+            asset = db.execute("SELECT * FROM assets WHERE id=? AND user_id=?", (asset_id, current_user().id)).fetchone() if asset_id else None
+        finally:
+            db.close()
+        if asset_id and not asset:
+            return "Not found", 404
+        return user_page("asset_form", "Edit asset" if asset else "New asset", asset=asset, types=types)
+
+    @app.post("/assets")
+    @app.post("/assets/<int:asset_id>")
+    @require_user
+    def asset_save(asset_id=None):
         if not valid_user_csrf():
             return "Invalid CSRF token", 403
         user = current_user()
@@ -97,28 +124,46 @@ def register_routes(app):
             type_id, scale = int(request.form.get("type_id", "0")), int(request.form.get("scale", "8"))
         except ValueError:
             return "Invalid asset", 400
-        if not name or not unit or not 0 <= scale <= 12 or request.form.get("quote_currency") not in {"IDR", "USD"} or request.form.get("pricing_mode") not in {"manual", "automatic", "fixed"}:
+        mode, provider, provider_symbol = request.form.get("pricing_mode"), request.form.get("provider", "").strip(), request.form.get("provider_symbol", "").strip()
+        if not name or not unit or not 0 <= scale <= 12 or request.form.get("quote_currency") not in {"IDR", "USD"} or mode not in {"manual", "automatic", "fixed"} or (mode == "automatic" and (provider not in {"yahoo", "finnhub", "kraken", "metalsdev"} or not provider_symbol)):
             return "Invalid asset", 400
         db = connect(app.config["SIPD_DB"])
         try:
             if not db.execute("SELECT 1 FROM investment_types WHERE id=? AND user_id=?", (type_id, user.id)).fetchone():
                 return "Invalid investment type", 400
-            db.execute("""INSERT INTO assets(user_id,investment_type_id,name,symbol,unit,quantity_scale,quote_currency,pricing_mode,provider,provider_symbol)
-                          VALUES(?,?,?,?,?,?,?,?,?,?)""", (user.id, type_id, name, request.form.get("symbol", "").strip(), unit, scale, request.form["quote_currency"], request.form["pricing_mode"], request.form.get("provider", ""), request.form.get("provider_symbol", "").strip()))
-            asset_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            if asset_id:
+                if not db.execute("SELECT 1 FROM assets WHERE id=? AND user_id=?", (asset_id, user.id)).fetchone():
+                    return "Not found", 404
+                db.execute("UPDATE assets SET investment_type_id=?,name=?,symbol=?,unit=?,quantity_scale=?,quote_currency=?,pricing_mode=?,provider=?,provider_symbol=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", (type_id, name, request.form.get("symbol", "").strip(), unit, scale, request.form["quote_currency"], mode, provider, provider_symbol, asset_id, user.id))
+            else:
+                db.execute("INSERT INTO assets(user_id,investment_type_id,name,symbol,unit,quantity_scale,quote_currency,pricing_mode,provider,provider_symbol) VALUES(?,?,?,?,?,?,?,?,?,?)", (user.id, type_id, name, request.form.get("symbol", "").strip(), unit, scale, request.form["quote_currency"], mode, provider, provider_symbol))
+                asset_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
         finally:
             db.close()
-        return redirect(f"/assets/{asset_id}", 303)
+        return redirect("/assets", 303)
+
+    @app.post("/assets/<int:asset_id>/archive")
+    @require_user
+    def asset_archive(asset_id):
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        db = connect(app.config["SIPD_DB"])
+        try:
+            result = db.execute("UPDATE assets SET active=0,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", (asset_id, current_user().id))
+        finally:
+            db.close()
+        return redirect("/assets", 303) if result.rowcount else ("Not found", 404)
 
     @app.get("/assets/<int:asset_id>")
     @require_user
     def asset_detail(asset_id):
         db = connect(app.config["SIPD_DB"])
         try:
-            asset = db.execute("SELECT id,name FROM assets WHERE id=? AND user_id=?", (asset_id, current_user().id)).fetchone()
+            asset = db.execute("SELECT a.*,t.name type_name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.id=? AND a.user_id=?", (asset_id, current_user().id)).fetchone()
+            transactions = db.execute("SELECT * FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at DESC,id DESC", (current_user().id, asset_id)).fetchall() if asset else []
         finally:
             db.close()
-        return (render_template_string("<h1>{{ asset.name }}</h1>", asset=asset), 200) if asset else ("Not found", 404)
+        return user_page("asset_detail", asset["name"], asset=asset, transactions=transactions) if asset else ("Not found", 404)
 
     @app.post("/transactions")
     @require_user
@@ -135,12 +180,21 @@ def register_routes(app):
             return "Invalid transaction", 400
         db = connect(app.config["SIPD_DB"])
         try:
-            asset = db.execute("SELECT quote_currency FROM assets WHERE id=? AND user_id=?", (asset_id, user.id)).fetchone()
+            asset = db.execute("SELECT quote_currency,pricing_mode FROM assets WHERE id=? AND user_id=?", (asset_id, user.id)).fetchone()
             if not asset:
                 return "Not found", 404
+            if asset["pricing_mode"] == "fixed" and price != 1:
+                return "Cash fixed price must be 1", 400
+            existing = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at,id", (user.id, asset_id)).fetchall()
+            entries = [LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in existing]
+            try:
+                calculate_position(entries + [LedgerEntry(0, request.form["kind"], quantity, price, fx, datetime.fromisoformat(request.form["occurred_at"]))])
+            except ValueError as error:
+                return str(error), 400
             db.execute("""INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key)
-                          VALUES(?,?,?,?,?,?,?,?,?,?)""", (user.id, asset_id, request.form["kind"], str(quantity), str(price), asset["quote_currency"], str(fx), request.form["occurred_at"].replace("T", " ") + ":00", request.form.get("notes", ""), request.form["idempotency_key"]))
+                          VALUES(?,?,?,?,?,?,?,?,?,?)""", (user.id, asset_id, request.form["kind"], str(quantity), str(price), asset["quote_currency"], str(fx), request.form["occurred_at"] + ":00Z", request.form.get("notes", "").strip(), request.form["idempotency_key"]))
             transaction_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset_id, str(price), asset["quote_currency"], "Transaction", request.form["occurred_at"] + ":00Z"))
         except Exception as error:
             if "UNIQUE constraint failed" in str(error):
                 return redirect("/transactions", 303)
@@ -149,20 +203,63 @@ def register_routes(app):
             db.close()
         return redirect(f"/transactions/{transaction_id}", 303)
 
+    @app.get("/transactions")
+    @require_user
+    def transactions():
+        db = connect(app.config["SIPD_DB"])
+        try:
+            transactions = db.execute("SELECT t.*,a.name asset_name FROM transactions t JOIN assets a ON a.id=t.asset_id WHERE t.user_id=? ORDER BY t.occurred_at DESC,t.id DESC", (current_user().id,)).fetchall()
+            assets = db.execute("SELECT id,name FROM assets WHERE user_id=? AND active=1 ORDER BY name", (current_user().id,)).fetchall()
+        finally:
+            db.close()
+        return user_page("transactions", "Transactions", transactions=transactions, assets=assets)
+
+    @app.get("/transactions/new")
+    @require_user
+    def transaction_form():
+        db = connect(app.config["SIPD_DB"])
+        try:
+            assets = db.execute("SELECT id,name,quote_currency,pricing_mode FROM assets WHERE user_id=? AND active=1 ORDER BY name", (current_user().id,)).fetchall()
+        finally:
+            db.close()
+        return user_page("transaction_form", "New transaction", assets=assets, idempotency_key=f"tx-{datetime.now(timezone.utc).timestamp():.6f}")
+
     @app.get("/transactions/<int:transaction_id>")
     @require_user
     def transaction_detail(transaction_id):
         db = connect(app.config["SIPD_DB"])
         try:
-            row = db.execute("SELECT id,kind FROM transactions WHERE id=? AND user_id=?", (transaction_id, current_user().id)).fetchone()
+            row = db.execute("SELECT t.*,a.name asset_name FROM transactions t JOIN assets a ON a.id=t.asset_id WHERE t.id=? AND t.user_id=?", (transaction_id, current_user().id)).fetchone()
         finally:
             db.close()
-        return (render_template_string("<h1>{{ row.kind }}</h1>", row=row), 200) if row else ("Not found", 404)
+        return user_page("transaction_detail", "Transaction", transaction=row) if row else ("Not found", 404)
+
+    @app.post("/transactions/<int:transaction_id>/delete")
+    @require_user
+    def transaction_delete(transaction_id):
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        db = connect(app.config["SIPD_DB"])
+        try:
+            row = db.execute("SELECT asset_id FROM transactions WHERE id=? AND user_id=?", (transaction_id, current_user().id)).fetchone()
+            if not row:
+                return "Not found", 404
+            db.execute("DELETE FROM transactions WHERE id=? AND user_id=?", (transaction_id, current_user().id))
+            db.execute("DELETE FROM asset_prices WHERE user_id=? AND asset_id=? AND source='Transaction'", (current_user().id, row["asset_id"]))
+            db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) SELECT user_id,asset_id,unit_price,quote_currency,'Transaction',occurred_at FROM transactions WHERE user_id=? AND asset_id=?", (current_user().id, row["asset_id"]))
+        finally:
+            db.close()
+        return redirect("/transactions", 303)
 
     @app.get("/settings")
     @require_user
     def settings():
-        return render_template_string("<h1>Settings</h1>")
+        db = connect(app.config["SIPD_DB"])
+        try:
+            types = db.execute("SELECT id,name,active FROM investment_types WHERE user_id=? ORDER BY active DESC,name", (current_user().id,)).fetchall()
+        finally:
+            db.close()
+        return user_page("settings", "Settings", types=types)
 
     @app.post("/settings/currency")
     @require_user
@@ -178,6 +275,55 @@ def register_routes(app):
         finally:
             db.close()
         return redirect("/settings", 303)
+
+    @app.post("/settings/types")
+    @app.post("/settings/types/<int:type_id>")
+    @require_user
+    def type_save(type_id=None):
+        if not valid_user_csrf() or not request.form.get("name", "").strip():
+            return "Name required", 400
+        db = connect(app.config["SIPD_DB"])
+        try:
+            if type_id:
+                db.execute("UPDATE investment_types SET name=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", (request.form["name"].strip(), type_id, current_user().id))
+            else:
+                db.execute("INSERT INTO investment_types(user_id,name) VALUES(?,?)", (current_user().id, request.form["name"].strip()))
+        finally:
+            db.close()
+        return redirect("/settings", 303)
+
+    @app.post("/settings/types/<int:type_id>/archive")
+    @require_user
+    def type_archive(type_id):
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        db = connect(app.config["SIPD_DB"])
+        try:
+            in_use = db.execute("SELECT 1 FROM assets WHERE user_id=? AND investment_type_id=? LIMIT 1", (current_user().id, type_id)).fetchone()
+            if in_use:
+                db.execute("UPDATE investment_types SET active=0,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", (type_id, current_user().id))
+            else:
+                db.execute("DELETE FROM investment_types WHERE id=? AND user_id=?", (type_id, current_user().id))
+        finally:
+            db.close()
+        return redirect("/settings", 303)
+
+    @app.get("/settings/tickers")
+    @require_user
+    def ticker_check():
+        provider, query = request.args.get("provider", "yahoo"), request.args.get("q", "").strip()
+        if provider not in {"yahoo", "finnhub"}:
+            return user_page("ticker_check", "Ticker lookup", provider=provider, query=query, error="Unsupported ticker provider")
+        if len(query) > 64 or any(ord(char) < 32 for char in query):
+            return user_page("ticker_check", "Ticker lookup", provider=provider, query=query, error="Search must be 1–64 printable characters")
+        result = None
+        if query and provider == "yahoo":
+            quotes, errors = yahoo_quotes((query,))
+            if query in quotes:
+                result = quotes[query]
+            else:
+                return user_page("ticker_check", "Ticker lookup", provider=provider, query=query, error=errors.get(query, "No matching symbol"))
+        return user_page("ticker_check", "Ticker lookup", provider=provider, query=query, result=result)
 
     @app.post("/refresh")
     @require_user
