@@ -304,22 +304,33 @@ def register_routes(app):
             return "Invalid transaction", 400
         db = connect(app.config["SIPD_DB"])
         try:
-            asset = db.execute("SELECT quote_currency,pricing_mode FROM assets WHERE id=? AND user_id=?", (asset_id, user.id)).fetchone()
+            asset = db.execute("SELECT id,quote_currency,pricing_mode FROM assets WHERE id=? AND user_id=?", (asset_id, user.id)).fetchone()
             if not asset:
                 return "Not found", 404
             if asset["pricing_mode"] == "fixed" and price != 1:
                 return "Cash fixed price must be 1", 400
-            existing = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at,id", (user.id, asset_id)).fetchall()
-            entries = [LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in existing]
-            try:
-                calculate_position(entries + [LedgerEntry(0, request.form["kind"], quantity, price, fx, occurred_at)])
-            except ValueError as error:
-                return str(error), 400
-            db.execute("""INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key)
-                          VALUES(?,?,?,?,?,?,?,?,?,?)""", (user.id, asset_id, request.form["kind"], str(quantity), str(price), asset["quote_currency"], str(fx), occurred_at.isoformat().replace("+00:00", "Z"), request.form.get("notes", "").strip(), request.form["idempotency_key"]))
-            transaction_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset_id, str(price), asset["quote_currency"], "Transaction", occurred_at.isoformat().replace("+00:00", "Z")))
+            with transaction(db):
+                entries = ledger_entries(db, user.id, asset_id)
+                calculate_position(entries + [LedgerEntry(max((entry.id for entry in entries), default=0) + 1, request.form["kind"], quantity, price, fx, occurred_at)])
+                wallet = ensure_wallet(db, user.id) if request.form["kind"] in {"buy", "sell"} else None
+                pair = None
+                if wallet and asset["id"] != wallet["id"]:
+                    pair_kind = "withdrawal" if request.form["kind"] == "buy" else "deposit"
+                    pair_amount = quantity * price * fx
+                    wallet_entries = ledger_entries(db, user.id, wallet["id"])
+                    calculate_position(wallet_entries + [LedgerEntry(max((entry.id for entry in wallet_entries), default=0) + 1, pair_kind, pair_amount, Decimal("1"), Decimal("1"), occurred_at)])
+                    pair = (pair_kind, pair_amount, wallet)
+                db.execute("""INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key)
+                              VALUES(?,?,?,?,?,?,?,?,?,?)""", (user.id, asset_id, request.form["kind"], str(quantity), str(price), asset["quote_currency"], str(fx), occurred_at.isoformat().replace("+00:00", "Z"), request.form.get("notes", "").strip(), request.form["idempotency_key"]))
+                transaction_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+                db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset_id, str(price), asset["quote_currency"], "Transaction", occurred_at.isoformat().replace("+00:00", "Z")))
+                if pair:
+                    pair_kind, pair_amount, wallet = pair
+                    db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?)", (user.id, wallet["id"], pair_kind, str(pair_amount), "1", "IDR", "1", occurred_at.isoformat().replace("+00:00", "Z"), f"Auto Wallet movement for transaction #{transaction_id}", f"rdn:auto:{transaction_id}"))
+                    db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, wallet["id"], "1", "IDR", "Transaction", occurred_at.isoformat().replace("+00:00", "Z")))
         except Exception as error:
+            if isinstance(error, ValueError):
+                return str(error), 400
             if "UNIQUE constraint failed" in str(error):
                 return redirect("/transactions", 303)
             raise

@@ -166,6 +166,60 @@ def test_wallet_withdraw_rejects_insufficient_balance(client, existing_session):
     assert response.status_code == 400
 
 
+def test_asset_buy_debits_wallet(client, existing_session, app):
+    client.set_cookie("sipd_session", existing_session)
+    assert client.post("/wallet/top-up", data={"csrf_token": "csrf", "amount": "100", "occurred_at": "2026-08-26T11:59", "idempotency_key": "fund"}).status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Fund','unit','IDR','manual')")
+        asset_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    finally:
+        db.close()
+    response = client.post("/transactions", data={"csrf_token": "csrf", "asset_id": asset_id, "kind": "buy", "quantity": "1", "price": "40", "fx_rate": "1", "occurred_at": "2026-08-26T12:00", "idempotency_key": "buy"})
+    assert response.status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        rows = db.execute("SELECT kind,quantity FROM transactions WHERE user_id=1 AND asset_id=(SELECT id FROM assets WHERE user_id=1 AND name='RDN') ORDER BY id").fetchall()
+        assert [tuple(row) for row in rows] == [("deposit", "100"), ("withdrawal", "40")]
+    finally:
+        db.close()
+
+
+def test_asset_buy_rejects_when_wallet_is_insufficient(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Fund','unit','IDR','manual')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+    response = client.post("/transactions", data={"csrf_token": "csrf", "asset_id": "1", "kind": "buy", "quantity": "1", "price": "40", "fx_rate": "1", "occurred_at": "2026-08-26T12:00", "idempotency_key": "unfunded"})
+    assert response.status_code == 400
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT count(*) FROM transactions WHERE user_id=1").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_asset_sell_credits_wallet(client, existing_session, app):
+    client.set_cookie("sipd_session", existing_session)
+    assert client.post("/wallet/top-up", data={"csrf_token": "csrf", "amount": "100", "occurred_at": "2026-08-26T11:59", "idempotency_key": "fund"}).status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Fund','unit','IDR','manual')")
+        asset_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    finally:
+        db.close()
+    for kind, price, at, key in (("buy", "40", "2026-08-26T12:00", "buy"), ("sell", "50", "2026-08-26T12:01", "sell")):
+        assert client.post("/transactions", data={"csrf_token": "csrf", "asset_id": asset_id, "kind": kind, "quantity": "1", "price": price, "fx_rate": "1", "occurred_at": at, "idempotency_key": key}).status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        rows = db.execute("SELECT kind,quantity FROM transactions WHERE user_id=1 AND asset_id=(SELECT id FROM assets WHERE user_id=1 AND name='RDN') ORDER BY id").fetchall()
+        assert [tuple(row) for row in rows] == [("deposit", "100"), ("withdrawal", "40"), ("deposit", "50")]
+    finally:
+        db.close()
+
+
 def test_transactions_list_renders_without_asset_detail_context(client, existing_session, app):
     db = connect(app.config["SIPD_DB"])
     try:
