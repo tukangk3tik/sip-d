@@ -45,6 +45,10 @@ def register_routes(app):
         db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) SELECT ?,?,'1','IDR','Fixed',? WHERE NOT EXISTS (SELECT 1 FROM asset_prices WHERE user_id=? AND asset_id=?)", (user_id, asset["id"], datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), user_id, asset["id"]))
         return db.execute("SELECT a.*,t.name type_name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.id=? AND a.user_id=?", (asset["id"], user_id)).fetchone()
 
+    def rebuild_transaction_prices(db, user_id, asset_id):
+        db.execute("DELETE FROM asset_prices WHERE user_id=? AND asset_id=? AND source='Transaction'", (user_id, asset_id))
+        db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) SELECT user_id,asset_id,unit_price,quote_currency,'Transaction',occurred_at FROM transactions WHERE user_id=? AND asset_id=?", (user_id, asset_id))
+
     def allow_login():
         attempts = app.extensions.setdefault("sipd_login_attempts", {})
         ip, cutoff = request.remote_addr or "", time.monotonic() - 900
@@ -374,14 +378,28 @@ def register_routes(app):
     def transaction_delete(transaction_id):
         if not valid_user_csrf():
             return "Invalid CSRF token", 403
+        user = current_user()
         db = connect(app.config["SIPD_DB"])
         try:
-            row = db.execute("SELECT asset_id FROM transactions WHERE id=? AND user_id=?", (transaction_id, current_user().id)).fetchone()
+            row = db.execute("SELECT asset_id,idempotency_key FROM transactions WHERE id=? AND user_id=?", (transaction_id, user.id)).fetchone()
             if not row:
                 return "Not found", 404
-            db.execute("DELETE FROM transactions WHERE id=? AND user_id=?", (transaction_id, current_user().id))
-            db.execute("DELETE FROM asset_prices WHERE user_id=? AND asset_id=? AND source='Transaction'", (current_user().id, row["asset_id"]))
-            db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) SELECT user_id,asset_id,unit_price,quote_currency,'Transaction',occurred_at FROM transactions WHERE user_id=? AND asset_id=?", (current_user().id, row["asset_id"]))
+            if row["idempotency_key"].startswith("rdn:auto:"):
+                return "Delete the linked asset transaction instead", 400
+            try:
+                with transaction(db):
+                    calculate_position(ledger_entries(db, user.id, row["asset_id"], transaction_id))
+                    pair = db.execute("SELECT id,asset_id FROM transactions WHERE user_id=? AND idempotency_key=?", (user.id, f"rdn:auto:{transaction_id}")).fetchone()
+                    if pair:
+                        calculate_position(ledger_entries(db, user.id, pair["asset_id"], pair["id"]))
+                    db.execute("DELETE FROM transactions WHERE id=? AND user_id=?", (transaction_id, user.id))
+                    if pair:
+                        db.execute("DELETE FROM transactions WHERE id=? AND user_id=?", (pair["id"], user.id))
+                    rebuild_transaction_prices(db, user.id, row["asset_id"])
+                    if pair and pair["asset_id"] != row["asset_id"]:
+                        rebuild_transaction_prices(db, user.id, pair["asset_id"])
+            except ValueError as error:
+                return str(error), 400
         finally:
             db.close()
         return redirect("/transactions", 303)
