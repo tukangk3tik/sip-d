@@ -74,7 +74,8 @@ jobs:
             sudo systemctl daemon-reload
             was_go=0
             if sudo systemctl is-active --quiet sip-d; then was_go=1; sudo systemctl stop sip-d; fi
-            sudo systemctl enable --now sip-d-python
+            sudo systemctl enable sip-d-python
+            sudo systemctl restart sip-d-python
             if ! curl --fail --retry 5 --retry-delay 2 --retry-connrefused http://127.0.0.1:8090/healthz; then
               sudo systemctl stop sip-d-python
               if [ "$was_go" = 1 ]; then sudo systemctl start sip-d; fi
