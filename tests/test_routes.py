@@ -110,6 +110,21 @@ def test_dashboard_renders_jinja_navigation(client, existing_session):
     assert 'href="/transactions"' in page.text
 
 
+def test_dashboard_renders_portfolio_summary(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Cash','IDR','IDR','fixed')")
+        db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,idempotency_key) VALUES(1,1,'deposit','10','1','IDR','1','2026-08-26T12:00:00Z','dashboard')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+    page = client.get("/")
+    assert "Total value" in page.text
+    assert "Net invested" in page.text
+    assert "Allocation by asset" in page.text
+    assert "Cash" in page.text
+
+
 def test_transactions_list_renders_without_asset_detail_context(client, existing_session, app):
     db = connect(app.config["SIPD_DB"])
     try:

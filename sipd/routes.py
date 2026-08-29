@@ -60,13 +60,43 @@ def register_routes(app):
     @app.get("/")
     @require_user
     def dashboard():
+        user = current_user()
         db = connect(app.config["SIPD_DB"])
         try:
-            assets = db.execute("SELECT a.id,a.name,a.unit,a.quote_currency,a.pricing_mode,COALESCE((SELECT price FROM asset_prices p WHERE p.user_id=a.user_id AND p.asset_id=a.id ORDER BY priced_at DESC LIMIT 1),'') price FROM assets a WHERE a.user_id=? AND a.active=1 ORDER BY a.name", (current_user().id,)).fetchall()
-            snapshots = db.execute("SELECT created_at,total_value_idr FROM portfolio_snapshots WHERE user_id=? ORDER BY id DESC LIMIT 10", (current_user().id,)).fetchall()
+            rate_row = db.execute("SELECT rate FROM exchange_rates WHERE user_id=? AND base_currency='USD' AND quote_currency='IDR' ORDER BY priced_at DESC LIMIT 1", (user.id,)).fetchone()
+            rate = Decimal(rate_row["rate"]) if rate_row else Decimal()
+            assets = db.execute("SELECT a.id,a.name,a.unit,a.quote_currency,a.pricing_mode,t.name type_name,COALESCE((SELECT price FROM asset_prices p WHERE p.user_id=a.user_id AND p.asset_id=a.id ORDER BY priced_at DESC LIMIT 1),'') price FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.user_id=? AND a.active=1 ORDER BY a.name", (user.id,)).fetchall()
+            holdings, total, net_invested, realized, unrealized, type_totals = [], Decimal(), Decimal(), Decimal(), Decimal(), {}
+            for asset in assets:
+                rows = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at,id", (user.id, asset["id"])).fetchall()
+                position = calculate_position([LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in rows])
+                price = Decimal("1") if asset["pricing_mode"] == "fixed" else Decimal(asset["price"] or "0")
+                value = position.quantity * price * (rate if asset["quote_currency"] == "USD" else Decimal("1"))
+                holding = dict(asset, quantity=position.quantity, market_value=value, unrealized=value - position.cost_basis, net_invested=position.net_invested, realized=position.realized, has_price=bool(asset["price"]) or asset["pricing_mode"] == "fixed")
+                holdings.append(holding)
+                total += value
+                net_invested += position.net_invested
+                realized += position.realized
+                unrealized += holding["unrealized"]
+                type_totals[asset["type_name"]] = type_totals.get(asset["type_name"], Decimal()) + value
+            snapshots = db.execute("SELECT created_at,total_value_idr FROM portfolio_snapshots WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (user.id,)).fetchall()
+            refresh = db.execute("SELECT status,error_summary,created_at FROM price_refreshes WHERE user_id=? ORDER BY id DESC LIMIT 1", (user.id,)).fetchone()
         finally:
             db.close()
-        return user_page("dashboard", "Dashboard", assets=assets, snapshots=snapshots, refresh_key=secrets.token_urlsafe(18))
+        display_currency = "USD" if user.currency == "USD" and rate > 0 else "IDR"
+
+        def money(value):
+            if display_currency == "USD":
+                value /= rate
+            return f"{value:,.2f} {display_currency}"
+
+        def allocation(name, value):
+            return {"name": name, "value": money(value), "percent": f"{(value / total * 100) if total else Decimal():.1f}"}
+
+        top = [dict(holding, value=money(holding["market_value"]), percent=f"{(holding['market_value'] / total * 100) if total else Decimal():.1f}") for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)[:3]]
+        for holding in holdings:
+            holding.update(value=money(holding["market_value"]), unrealized_display=money(holding["unrealized"]), performance="gain" if holding["unrealized"] > 0 else "loss" if holding["unrealized"] < 0 else "")
+        return user_page("dashboard", "Dashboard", holdings=holdings, top=top, total=money(total), net_invested=money(net_invested), realized=money(realized), unrealized=money(unrealized), total_return=f"{((realized + unrealized) / net_invested * 100) if net_invested else Decimal():.1f}", type_alloc=[allocation(name, value) for name, value in sorted(type_totals.items(), key=lambda item: item[1], reverse=True)], asset_alloc=[allocation(holding["name"], holding["market_value"]) for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)], snapshots=[{"created_at": row["created_at"], "value": money(Decimal(row["total_value_idr"]))} for row in snapshots], refresh=refresh, refresh_key=secrets.token_urlsafe(18))
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
