@@ -108,6 +108,8 @@ def test_dashboard_renders_jinja_navigation(client, existing_session):
     page = client.get("/")
     assert page.status_code == 200
     assert 'href="/transactions"' in page.text
+    assert 'class="sidebar-nav"' in page.text
+    assert "Portfolio" in page.text
 
 
 def test_dashboard_renders_portfolio_summary(client, existing_session, app):
