@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from flask import jsonify, make_response, redirect, render_template, render_template_string, request
 
 from sipd.auth import anon_token, create_session, current_user, delete_session, require_user, valid_anon_csrf, valid_user_csrf
-from sipd.db import connect
+from sipd.db import connect, transaction
 from sipd.domain import LedgerEntry, calculate_position
 from sipd.providers import quote_for_asset, usd_idr_quote, yahoo_quotes
 
@@ -18,6 +18,33 @@ def user_page(view, title, **context):
 
 
 def register_routes(app):
+    def ledger_entries(db, user_id, asset_id, omit_id=0):
+        rows = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? AND id<>? ORDER BY occurred_at,id", (user_id, asset_id, omit_id)).fetchall()
+        return [LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in rows]
+
+    def ensure_wallet(db, user_id):
+        wallet_type = db.execute("SELECT id FROM investment_types WHERE user_id=? AND name='Wallet'", (user_id,)).fetchone()
+        legacy_type = db.execute("SELECT id FROM investment_types WHERE user_id=? AND name='RDN Wallet'", (user_id,)).fetchone()
+        if not wallet_type:
+            if legacy_type:
+                db.execute("UPDATE investment_types SET name='Wallet',active=1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (legacy_type["id"],))
+                wallet_type = legacy_type
+            else:
+                db.execute("INSERT INTO investment_types(user_id,name) VALUES(?, 'Wallet')", (user_id,))
+                wallet_type = db.execute("SELECT last_insert_rowid() id").fetchone()
+        elif legacy_type:
+            db.execute("UPDATE assets SET investment_type_id=? WHERE user_id=? AND investment_type_id=? AND name='RDN'", (wallet_type["id"], user_id, legacy_type["id"]))
+            db.execute("UPDATE investment_types SET active=0,updated_at=CURRENT_TIMESTAMP WHERE id=?", (legacy_type["id"],))
+        db.execute("UPDATE investment_types SET active=1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (wallet_type["id"],))
+        asset = db.execute("SELECT id FROM assets WHERE user_id=? AND name='RDN'", (user_id,)).fetchone()
+        if asset:
+            db.execute("UPDATE assets SET investment_type_id=?,symbol='RDN',unit='IDR',quantity_scale=0,quote_currency='IDR',pricing_mode='fixed',provider='',provider_symbol='',active=1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", (wallet_type["id"], asset["id"], user_id))
+        else:
+            db.execute("INSERT INTO assets(user_id,investment_type_id,name,symbol,unit,quantity_scale,quote_currency,pricing_mode) VALUES(?,?, 'RDN','RDN','IDR',0,'IDR','fixed')", (user_id, wallet_type["id"]))
+            asset = db.execute("SELECT last_insert_rowid() id").fetchone()
+        db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) SELECT ?,?,'1','IDR','Fixed',? WHERE NOT EXISTS (SELECT 1 FROM asset_prices WHERE user_id=? AND asset_id=?)", (user_id, asset["id"], datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), user_id, asset["id"]))
+        return db.execute("SELECT a.*,t.name type_name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.id=? AND a.user_id=?", (asset["id"], user_id)).fetchone()
+
     def allow_login():
         attempts = app.extensions.setdefault("sipd_login_attempts", {})
         ip, cutoff = request.remote_addr or "", time.monotonic() - 900
@@ -130,6 +157,20 @@ def register_routes(app):
         response = redirect("/login", 303)
         response.delete_cookie("sipd_session")
         return response
+
+    @app.get("/wallet")
+    @require_user
+    def wallet():
+        user = current_user()
+        db = connect(app.config["SIPD_DB"])
+        try:
+            with transaction(db):
+                asset = ensure_wallet(db, user.id)
+            position = calculate_position(ledger_entries(db, user.id, asset["id"]))
+            transactions = db.execute("SELECT t.*,a.name asset_name FROM transactions t JOIN assets a ON a.id=t.asset_id WHERE t.user_id=? AND t.asset_id=? ORDER BY t.occurred_at DESC,t.id DESC", (user.id, asset["id"])).fetchall()
+        finally:
+            db.close()
+        return user_page("wallet", "Wallet", wallet=asset, balance=position.quantity, transactions=transactions, refresh_key=secrets.token_urlsafe(18))
 
     @app.get("/assets")
     @require_user

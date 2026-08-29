@@ -125,6 +125,34 @@ def test_dashboard_renders_portfolio_summary(client, existing_session, app):
     assert "Cash" in page.text
 
 
+def test_wallet_page_provisions_fixed_idr_wallet(client, existing_session, app):
+    client.set_cookie("sipd_session", existing_session)
+    assert client.get("/wallet").status_code == 200
+    db = connect(app.config["SIPD_DB"])
+    try:
+        row = db.execute("SELECT a.name,a.unit,a.quote_currency,a.pricing_mode,t.name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.user_id=1").fetchone()
+        assert tuple(row) == ("RDN", "IDR", "IDR", "fixed", "Wallet")
+    finally:
+        db.close()
+
+
+def test_wallet_renames_legacy_rdn_wallet_type(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO investment_types(user_id,name) VALUES(1,'RDN Wallet')")
+        legacy_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,?,'RDN','IDR','IDR','fixed')", (legacy_id,))
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+    assert client.get("/wallet").status_code == 200
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT t.name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.user_id=1 AND a.name='RDN'").fetchone()[0] == "Wallet"
+    finally:
+        db.close()
+
+
 def test_transactions_list_renders_without_asset_detail_context(client, existing_session, app):
     db = connect(app.config["SIPD_DB"])
     try:
