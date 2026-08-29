@@ -112,6 +112,16 @@ def test_dashboard_renders_jinja_navigation(client, existing_session):
     assert "Portfolio" in page.text
 
 
+def test_dashboard_renders_a_mobile_navigation_control(client, existing_session):
+    client.set_cookie("sipd_session", existing_session)
+    page = client.get("/")
+
+    assert 'id="nav-toggle"' in page.text
+    assert 'aria-controls="sidebar"' in page.text
+    assert 'id="nav-backdrop"' in page.text
+    assert 'id="sidebar" tabindex="-1"' in page.text
+
+
 def test_dashboard_renders_portfolio_summary(client, existing_session, app):
     db = connect(app.config["SIPD_DB"])
     try:
