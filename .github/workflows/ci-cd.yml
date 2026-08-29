@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,32 +14,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-python@v5
         with:
-          go-version: '1.23.x'
-          cache: true
-
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python3 -m pip install -r requirements.txt
       - name: Test
-        run: go test ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Build Linux AMD64 binary
-        env:
-          CGO_ENABLED: '1'
-          GOOS: linux
-          GOARCH: amd64
-        run: |
-          mkdir -p dist
-          go build -trimpath -ldflags='-s -w' -o dist/sip-d .
-
-      - name: Upload deployment binary
-        uses: actions/upload-artifact@v4
+        run: python3 -m pytest -q
+      - name: Check Gunicorn configuration
+        run: python3 -m gunicorn --check-config sipd.wsgi:app
+      - name: Package deployment source
+        run: tar -czf sip-d-python.tar.gz sipd static deploy requirements.txt migrations.sql
+      - uses: actions/upload-artifact@v4
         with:
-          name: sip-d-linux-amd64
-          path: dist/sip-d
+          name: sip-d-python
+          path: sip-d-python.tar.gz
           if-no-files-found: error
 
   deploy:
@@ -49,31 +40,24 @@ jobs:
       group: sip-d-production
       cancel-in-progress: false
     steps:
-      - name: Download deployment binary
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: sip-d-linux-amd64
-
+          name: sip-d-python
+          path: .
       - name: Verify deployment password is configured
         env:
           DEPLOY_SSH_PASSWORD: ${{ secrets.DEPLOY_SSH_PASSWORD }}
-        run: |
-          if [ -z "$DEPLOY_SSH_PASSWORD" ]; then
-            echo "DEPLOY_SSH_PASSWORD must be configured."
-            exit 1
-          fi
-
-      - name: Upload binary to VPS
+        run: test -n "$DEPLOY_SSH_PASSWORD"
+      - name: Upload Python release to VPS
         uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           password: ${{ secrets.DEPLOY_SSH_PASSWORD }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
-          source: sip-d
+          source: sip-d-python.tar.gz
           target: /tmp/
-
-      - name: Install and verify deployment
+      - name: Install and health-check Flask deployment
         uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
@@ -82,10 +66,25 @@ jobs:
           port: ${{ secrets.DEPLOY_PORT || 22 }}
           script: |
             set -eu
-            sudo install -D -o root -g root -m 0755 /tmp/sip-d /opt/sip-d/sip-d.new
-            if [ -f /opt/sip-d/sip-d ]; then
-              sudo cp -p /opt/sip-d/sip-d /opt/sip-d/sip-d.previous
+            staging=/tmp/sip-d-python
+            rm -rf "$staging"
+            mkdir -p "$staging"
+            tar -xzf /tmp/sip-d-python.tar.gz -C "$staging"
+            sudo install -d -o root -g root -m 0755 /opt/sip-d/sipd /opt/sip-d/static /opt/sip-d/deploy
+            sudo rsync -a --delete "$staging/sipd/" /opt/sip-d/sipd/
+            sudo rsync -a --delete "$staging/static/" /opt/sip-d/static/
+            sudo rsync -a --delete "$staging/deploy/" /opt/sip-d/deploy/
+            sudo install -o root -g root -m 0644 "$staging/requirements.txt" /opt/sip-d/requirements.txt
+            sudo install -o root -g root -m 0644 "$staging/migrations.sql" /opt/sip-d/migrations.sql
+            sudo test -x /opt/sip-d/venv/bin/python || sudo python3 -m venv /opt/sip-d/venv
+            sudo /opt/sip-d/venv/bin/pip install -r /opt/sip-d/requirements.txt
+            sudo install -o root -g root -m 0644 /opt/sip-d/deploy/sip-d-python.service /etc/systemd/system/sip-d-python.service
+            sudo systemctl daemon-reload
+            was_go=0
+            if sudo systemctl is-active --quiet sip-d; then was_go=1; sudo systemctl stop sip-d; fi
+            sudo systemctl enable --now sip-d-python
+            if ! curl --fail --retry 5 --retry-delay 2 --retry-connrefused http://127.0.0.1:8090/healthz; then
+              sudo systemctl stop sip-d-python
+              if [ "$was_go" = 1 ]; then sudo systemctl start sip-d; fi
+              exit 1
             fi
-            sudo mv /opt/sip-d/sip-d.new /opt/sip-d/sip-d
-            sudo systemctl restart sip-d
-            curl --fail --retry 5 --retry-delay 2 --retry-connrefused http://127.0.0.1:8090/healthz
