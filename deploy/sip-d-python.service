@@ -1,0 +1,26 @@
+[Unit]
+Description=SIP-D Flask portfolio monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sip-d
+Group=sip-d
+UMask=0077
+WorkingDirectory=/opt/sip-d
+EnvironmentFile=-/etc/sip-d.env
+Environment=SIPD_ADDR=127.0.0.1:8090
+Environment=SIPD_DB=/var/lib/sip-d/sip-d.db
+ExecStart=/opt/sip-d/venv/bin/gunicorn --bind ${SIPD_ADDR} sipd.wsgi:app
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sip-d
+
+[Install]
+WantedBy=multi-user.target

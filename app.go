@@ -87,10 +87,18 @@ type Page struct {
 	TypeAlloc, AssetAlloc                                                                             []Allocation
 	Snapshots                                                                                         []Snapshot
 	Asset                                                                                             *Asset
+	Wallet                                                                                            *Holding
 	Tx                                                                                                *Transaction
 	Tickers                                                                                           []TickerCheck
 	Total, NetInvested, Realized, Unrealized, Return                                                  decimal.Decimal
 }
+
+const (
+	rdnTypeName       = "RDN Wallet"
+	rdnAssetName      = "RDN"
+	rdnAutoKeyPrefix  = "rdn:auto:"
+	rdnAutoNotePrefix = "Auto RDN movement for transaction #"
+)
 
 func NewApp(path, baseURL, metalsKey, finnhubKey, rapidKey string) (*App, error) {
 	db, err := sql.Open("sqlite3", "file:"+path+"?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate")
@@ -105,6 +113,10 @@ func NewApp(path, baseURL, metalsKey, finnhubKey, rapidKey string) (*App, error)
 	a := &App{db: db, baseURL: baseURL, metalsKey: metalsKey, finnhubKey: finnhubKey, rapidKey: rapidKey, secure: strings.HasPrefix(baseURL, "https://"), client: &http.Client{Timeout: 6 * time.Second}, attempts: map[string][]time.Time{}}
 	a.tpl, err = template.New("page").Funcs(template.FuncMap{"money": formatMoney, "amount": formatAmount, "humanTime": formatTime, "add1": func(i int) int { return i + 1 }, "dec": func(d decimal.Decimal) string { return d.StringFixed(2) }, "pct": func(d decimal.Decimal) string { return d.StringFixed(2) + "%" }, "positive": func(d decimal.Decimal) bool { return d.IsPositive() }, "negative": func(d decimal.Decimal) bool { return d.IsNegative() }}).Parse(pageTemplate)
 	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err = a.ensureRDNWallets(); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -127,6 +139,10 @@ func (a *App) Routes() http.Handler {
 	m.HandleFunc("POST /login", a.loginPost)
 	m.HandleFunc("POST /logout", a.auth(a.csrf(a.logout)))
 	m.HandleFunc("GET /", a.auth(a.dashboard))
+	m.HandleFunc("GET /history", a.auth(a.history))
+	m.HandleFunc("GET /wallet", a.auth(a.wallet))
+	m.HandleFunc("POST /wallet/top-up", a.auth(a.csrf(a.walletTopUp)))
+	m.HandleFunc("POST /wallet/withdraw", a.auth(a.csrf(a.walletWithdraw)))
 	m.HandleFunc("POST /refresh", a.auth(a.csrf(a.refresh)))
 	m.HandleFunc("GET /assets", a.auth(a.assets))
 	m.HandleFunc("GET /assets/new", a.auth(a.assetForm))
@@ -240,6 +256,10 @@ func (a *App) setupPost(w http.ResponseWriter, r *http.Request) {
 			a.fail(w, err)
 			return
 		}
+	}
+	if _, err = a.ensureRDNWalletTx(tx, uid); err != nil {
+		a.fail(w, err)
+		return
 	}
 	if err = tx.Commit(); err != nil {
 		a.fail(w, err)
@@ -385,7 +405,7 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 	if p.NetInvested.IsPositive() {
 		p.Return = p.Realized.Add(p.Unrealized).Div(p.NetInvested).Mul(decimal.NewFromInt(100))
 	}
-	rows, _ := a.db.Query(`SELECT created_at,total_value_idr FROM portfolio_snapshots WHERE user_id=? ORDER BY created_at DESC LIMIT 30`, u.ID)
+	rows, _ := a.db.Query(`SELECT created_at,total_value_idr FROM portfolio_snapshots WHERE user_id=? ORDER BY created_at DESC LIMIT 10`, u.ID)
 	if rows != nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -420,6 +440,134 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	a.render(w, p)
+}
+
+func (a *App) history(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	_, rate, err := a.holdings(u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	p := Page{Title: "Portfolio History", View: "history", User: u, CSRF: u.CSRF, Currency: u.Currency}
+	rows, err := a.db.Query(`SELECT created_at,total_value_idr FROM portfolio_snapshots WHERE user_id=? ORDER BY created_at DESC`, u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s Snapshot
+		var value string
+		if err := rows.Scan(&s.At, &value); err != nil {
+			a.fail(w, err)
+			return
+		}
+		s.Value = mustDec(value)
+		if u.Currency == "USD" && rate.IsPositive() {
+			s.Value = s.Value.Div(rate)
+		}
+		p.Snapshots = append(p.Snapshots, s)
+	}
+	if err := rows.Err(); err != nil {
+		a.fail(w, err)
+		return
+	}
+	a.render(w, p)
+}
+
+func (a *App) wallet(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	asset, err := a.ensureRDNWallet(u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	hs, _, err := a.holdings(u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	var wallet Holding
+	for _, h := range hs {
+		if h.ID == asset.ID {
+			wallet = h
+			break
+		}
+	}
+	ts, err := a.listTransactions(u.ID, asset.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	a.render(w, Page{Title: "RDN Wallet", View: "wallet", User: u, CSRF: u.CSRF, Currency: u.Currency, Wallet: &wallet, Transactions: ts, RefreshKey: random(18)})
+}
+
+func (a *App) walletTopUp(w http.ResponseWriter, r *http.Request) {
+	a.walletAdjust(w, r, "deposit")
+}
+
+func (a *App) walletWithdraw(w http.ResponseWriter, r *http.Request) {
+	a.walletAdjust(w, r, "withdrawal")
+}
+
+func (a *App) walletAdjust(w http.ResponseWriter, r *http.Request, kind string) {
+	u := current(r)
+	amount, err := decimal.NewFromString(r.FormValue("amount"))
+	if err != nil || !amount.IsPositive() {
+		http.Error(w, "Invalid RDN amount", http.StatusBadRequest)
+		return
+	}
+	asset, err := a.ensureRDNWallet(u.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	at := time.Now().UTC()
+	if raw := r.FormValue("occurred_at"); raw != "" {
+		if at, err = time.Parse("2006-01-02T15:04", raw); err != nil {
+			http.Error(w, "Invalid transaction date", http.StatusBadRequest)
+			return
+		}
+		at = at.UTC()
+	}
+	entries, err := a.ledger(u.ID, asset.ID, 0)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	entries = append(entries, LedgerEntry{Kind: kind, Quantity: amount, Price: decimal.NewFromInt(1), FXToIDR: decimal.NewFromInt(1), At: at})
+	if _, err = CalculatePosition(entries); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	key := strings.TrimSpace(r.FormValue("idempotency_key"))
+	if key == "" {
+		key = random(18)
+	}
+	tx, err := a.db.Begin()
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?)`, u.ID, asset.ID, kind, amount.String(), "1", "IDR", "1", at.Format(time.RFC3339), strings.TrimSpace(r.FormValue("notes")), key); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			http.Redirect(w, r, "/wallet", http.StatusSeeOther)
+			return
+		}
+		a.fail(w, err)
+		return
+	}
+	if _, err = tx.Exec(`INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)`, u.ID, asset.ID, "1", "IDR", "Transaction", at.Format(time.RFC3339)); err != nil {
+		a.fail(w, err)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		a.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, "/wallet", http.StatusSeeOther)
 }
 
 func (a *App) assets(w http.ResponseWriter, r *http.Request) {
@@ -570,7 +718,31 @@ func (a *App) transactionSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	_, err = tx.Exec(`INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?)`, u.ID, aid, kind, q.String(), price.String(), asset.QuoteCurrency, fx.String(), at.UTC().Format(time.RFC3339), strings.TrimSpace(r.FormValue("notes")), r.FormValue("idempotency_key"))
+	var rdn Asset
+	rdnAmount := decimal.Zero
+	if usesRDNWallet(asset) && oneOf(kind, "buy", "sell") {
+		rdn, err = a.ensureRDNWalletTx(tx, u.ID)
+		if err != nil {
+			a.fail(w, err)
+			return
+		}
+		rdnAmount = q.Mul(price).Mul(fx)
+		rdnKind := "deposit"
+		if kind == "buy" {
+			rdnKind = "withdrawal"
+		}
+		rdnEntries, err := a.ledgerFrom(tx, u.ID, rdn.ID, 0)
+		if err != nil {
+			a.fail(w, err)
+			return
+		}
+		rdnEntries = append(rdnEntries, LedgerEntry{Kind: rdnKind, Quantity: rdnAmount, Price: decimal.NewFromInt(1), FXToIDR: decimal.NewFromInt(1), At: at})
+		if _, err = CalculatePosition(rdnEntries); err != nil {
+			http.Error(w, "RDN balance is insufficient", http.StatusBadRequest)
+			return
+		}
+	}
+	res, err := tx.Exec(`INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?)`, u.ID, aid, kind, q.String(), price.String(), asset.QuoteCurrency, fx.String(), at.UTC().Format(time.RFC3339), strings.TrimSpace(r.FormValue("notes")), r.FormValue("idempotency_key"))
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			http.Redirect(w, r, "/transactions", 303)
@@ -579,9 +751,24 @@ func (a *App) transactionSave(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	stockTxID, _ := res.LastInsertId()
 	if _, err = tx.Exec(`INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)`, u.ID, aid, price.String(), asset.QuoteCurrency, "Transaction", at.UTC().Format(time.RFC3339)); err != nil {
 		a.fail(w, err)
 		return
+	}
+	if rdnAmount.IsPositive() {
+		rdnKind := "deposit"
+		if kind == "buy" {
+			rdnKind = "withdrawal"
+		}
+		if _, err = tx.Exec(`INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?)`, u.ID, rdn.ID, rdnKind, rdnAmount.String(), "1", "IDR", "1", at.UTC().Format(time.RFC3339), rdnAutoNotePrefix+strconv.FormatInt(stockTxID, 10), rdnAutoKeyPrefix+strconv.FormatInt(stockTxID, 10)); err != nil {
+			a.fail(w, err)
+			return
+		}
+		if _, err = tx.Exec(`INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)`, u.ID, rdn.ID, "1", "IDR", "Transaction", at.UTC().Format(time.RFC3339)); err != nil {
+			a.fail(w, err)
+			return
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		a.fail(w, err)
@@ -603,13 +790,13 @@ func (a *App) transactionDelete(w http.ResponseWriter, r *http.Request) {
 	u := current(r)
 	id := pathID(r)
 	var aid int64
-	if a.db.QueryRow(`SELECT asset_id FROM transactions WHERE id=? AND user_id=?`, id, u.ID).Scan(&aid) != nil {
+	var key string
+	if a.db.QueryRow(`SELECT asset_id,idempotency_key FROM transactions WHERE id=? AND user_id=?`, id, u.ID).Scan(&aid, &key) != nil {
 		http.NotFound(w, r)
 		return
 	}
-	entries, _ := a.ledger(u.ID, aid, id)
-	if _, err := CalculatePosition(entries); err != nil {
-		http.Error(w, "Deletion would make the ledger invalid", 400)
+	if strings.HasPrefix(key, rdnAutoKeyPrefix) {
+		http.Error(w, "Delete the linked asset transaction instead", http.StatusBadRequest)
 		return
 	}
 	tx, err := a.db.Begin()
@@ -618,17 +805,51 @@ func (a *App) transactionDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
+	entries, err := a.ledgerFrom(tx, u.ID, aid, id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if _, err := CalculatePosition(entries); err != nil {
+		http.Error(w, "Deletion would make the ledger invalid", 400)
+		return
+	}
+	var pairID, pairAssetID int64
+	pairErr := tx.QueryRow(`SELECT id,asset_id FROM transactions WHERE user_id=? AND idempotency_key=?`, u.ID, rdnAutoKeyPrefix+strconv.FormatInt(id, 10)).Scan(&pairID, &pairAssetID)
+	if pairErr != nil && !errors.Is(pairErr, sql.ErrNoRows) {
+		a.fail(w, pairErr)
+		return
+	}
+	if pairID > 0 {
+		pairEntries, err := a.ledgerFrom(tx, u.ID, pairAssetID, pairID)
+		if err != nil {
+			a.fail(w, err)
+			return
+		}
+		if _, err := CalculatePosition(pairEntries); err != nil {
+			http.Error(w, "Deletion would make the RDN ledger invalid", http.StatusBadRequest)
+			return
+		}
+	}
 	if _, err = tx.Exec(`DELETE FROM transactions WHERE id=? AND user_id=?`, id, u.ID); err != nil {
 		a.fail(w, err)
 		return
 	}
-	if _, err = tx.Exec(`DELETE FROM asset_prices WHERE user_id=? AND asset_id=? AND source='Transaction'`, u.ID, aid); err != nil {
+	if pairID > 0 {
+		if _, err = tx.Exec(`DELETE FROM transactions WHERE id=? AND user_id=?`, pairID, u.ID); err != nil {
+			a.fail(w, err)
+			return
+		}
+	}
+	if err = rebuildTransactionPrices(tx, u.ID, aid); err != nil {
 		a.fail(w, err)
 		return
 	}
-	if _, err = tx.Exec(`INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) SELECT user_id,asset_id,unit_price,quote_currency,'Transaction',occurred_at FROM transactions WHERE user_id=? AND asset_id=?`, u.ID, aid); err != nil {
-		a.fail(w, err)
-		return
+	if pairID > 0 && pairAssetID != aid {
+		if err = rebuildTransactionPrices(tx, u.ID, pairAssetID); err != nil {
+			a.fail(w, err)
+			return
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		a.fail(w, err)
@@ -1088,6 +1309,107 @@ func (a *App) listTypes(uid int64) ([]InvestmentType, error) {
 	}
 	return out, rows.Err()
 }
+
+func (a *App) ensureRDNWallets() error {
+	rows, err := a.db.Query(`SELECT id FROM users`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if _, err := a.ensureRDNWallet(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *App) ensureRDNWallet(uid int64) (Asset, error) {
+	tx, err := a.db.Begin()
+	if err != nil {
+		return Asset{}, err
+	}
+	defer tx.Rollback()
+	asset, err := a.ensureRDNWalletTx(tx, uid)
+	if err != nil {
+		return Asset{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Asset{}, err
+	}
+	return asset, nil
+}
+
+func (a *App) ensureRDNWalletTx(db execQueryer, uid int64) (Asset, error) {
+	var typeID int64
+	err := db.QueryRow(`SELECT id FROM investment_types WHERE user_id=? AND name=?`, uid, rdnTypeName).Scan(&typeID)
+	if errors.Is(err, sql.ErrNoRows) {
+		res, err := db.Exec(`INSERT INTO investment_types(user_id,name) VALUES(?,?)`, uid, rdnTypeName)
+		if err != nil {
+			return Asset{}, err
+		}
+		typeID, err = res.LastInsertId()
+		if err != nil {
+			return Asset{}, err
+		}
+	} else if err != nil {
+		return Asset{}, err
+	} else if _, err = db.Exec(`UPDATE investment_types SET active=1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?`, typeID, uid); err != nil {
+		return Asset{}, err
+	}
+
+	var id int64
+	err = db.QueryRow(`SELECT id FROM assets WHERE user_id=? AND name=?`, uid, rdnAssetName).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		res, err := db.Exec(`INSERT INTO assets(user_id,investment_type_id,name,symbol,unit,quantity_scale,quote_currency,pricing_mode,active) VALUES(?,?,?,?,?,?,?,'fixed',1)`, uid, typeID, rdnAssetName, rdnAssetName, "IDR", 0, "IDR")
+		if err != nil {
+			return Asset{}, err
+		}
+		id, err = res.LastInsertId()
+		if err != nil {
+			return Asset{}, err
+		}
+	} else if err != nil {
+		return Asset{}, err
+	} else {
+		if _, err = db.Exec(`UPDATE assets SET investment_type_id=?,symbol=?,unit='IDR',quantity_scale=0,quote_currency='IDR',pricing_mode='fixed',provider='',provider_symbol='',active=1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?`, typeID, rdnAssetName, id, uid); err != nil {
+			return Asset{}, err
+		}
+	}
+	_, err = db.Exec(`INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) SELECT ?,?,'1','IDR','Fixed',? WHERE NOT EXISTS (SELECT 1 FROM asset_prices WHERE user_id=? AND asset_id=?)`, uid, id, time.Now().UTC().Format(time.RFC3339), uid, id)
+	if err != nil {
+		return Asset{}, err
+	}
+	return Asset{ID: id, TypeID: typeID, Name: rdnAssetName, Symbol: rdnAssetName, TypeName: rdnTypeName, Unit: "IDR", Scale: 0, QuoteCurrency: "IDR", PricingMode: "fixed", Active: true, Price: "1", PriceSource: "Fixed"}, nil
+}
+
+func isRDNAsset(v Asset) bool {
+	return v.Name == rdnAssetName && v.TypeName == rdnTypeName
+}
+
+func usesRDNWallet(v Asset) bool {
+	return !isRDNAsset(v)
+}
+
+func rebuildTransactionPrices(db execQueryer, uid, aid int64) error {
+	if _, err := db.Exec(`DELETE FROM asset_prices WHERE user_id=? AND asset_id=? AND source='Transaction'`, uid, aid); err != nil {
+		return err
+	}
+	_, err := db.Exec(`INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) SELECT user_id,asset_id,unit_price,quote_currency,'Transaction',occurred_at FROM transactions WHERE user_id=? AND asset_id=?`, uid, aid)
+	return err
+}
+
 func (a *App) listAssets(uid int64, activeOnly bool) ([]Asset, error) {
 	return a.listAssetsFrom(a.db, uid, activeOnly)
 }
@@ -1163,6 +1485,11 @@ func (a *App) holdings(uid int64) ([]Holding, decimal.Decimal, error) { return a
 type queryer interface {
 	Query(string, ...any) (*sql.Rows, error)
 	QueryRow(string, ...any) *sql.Row
+}
+
+type execQueryer interface {
+	queryer
+	Exec(string, ...any) (sql.Result, error)
 }
 
 func (a *App) holdingsTx(q queryer, uid int64) ([]Holding, decimal.Decimal, error) {

@@ -512,6 +512,13 @@ git commit -m "docs: add Flask deployment and rollback runbook"
 
 ## Plan self-review
 
+## Execution status (2026-08-27)
+
+- [x] Flask app factory, SQLite schema compatibility, Decimal accounting, database-backed sessions, CSRF, and login limiting.
+- [x] yfinance batching plus Kraken, Metals.dev, Finnhub, Frankfurter, and last-known-price fallbacks.
+- [x] Browser routes, Jinja forms, static URLs, transaction/archive/type workflows, refresh snapshots, and snapshot items.
+- [x] Gunicorn systemd cutover unit, environment compatibility notes, runbook, rollback steps, and smoke checks.
+
 - Spec coverage: Tasks 1–3 cover Flask, SQLite, schema, and Decimal parity; Task 4 covers sessions, CSRF, and headers; Task 5 covers yfinance and existing providers; Tasks 6–7 cover every route, UI, refresh, and snapshot behavior; Task 8 covers service, migration safety, cutover, and rollback.
 - Placeholder scan: no deferred implementation markers or unspecified components remain.
 - Interface consistency: all later route and refresh tasks consume the exact `create_app`, repository, auth, domain, and provider interfaces established by earlier tasks.

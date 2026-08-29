@@ -11,6 +11,8 @@
 /*.log
 /data/
 /node_modules/
+__pycache__/
+*.py[cod]
 /.worktrees/
 /deploy/sip-d.env
 /deploy/nginx.sip-d.conf

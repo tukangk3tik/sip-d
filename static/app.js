@@ -1,0 +1,1 @@
+document.querySelectorAll('form').forEach(form=>form.addEventListener('submit',event=>{const button=event.submitter;if(button?.classList.contains('danger')&&!confirm('Continue?'))event.preventDefault()}));
