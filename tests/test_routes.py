@@ -281,7 +281,9 @@ def test_transactions_list_renders_without_asset_detail_context(client, existing
 def test_ticker_lookup_route_and_static_assets(client, existing_session):
     client.set_cookie("sipd_session", existing_session)
     assert client.get("/settings/tickers").status_code == 200
-    assert client.get("/static/app.css").status_code == 200
+    css = client.get("/static/app.css")
+    assert css.status_code == 200
+    assert ".sidebar{display:flex;flex-direction:column" in css.text
     assert client.get("/static/webawesome/styles/webawesome.css").status_code == 200
 
 
