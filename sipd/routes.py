@@ -172,6 +172,45 @@ def register_routes(app):
             db.close()
         return user_page("wallet", "Wallet", wallet=asset, balance=position.quantity, transactions=transactions, refresh_key=secrets.token_urlsafe(18))
 
+    def wallet_adjust(kind):
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        user, key = current_user(), request.form.get("idempotency_key") or f"wallet-{time.time_ns()}"
+        try:
+            amount = Decimal(request.form.get("amount", ""))
+            occurred_at = datetime.fromisoformat(request.form["occurred_at"]).replace(tzinfo=timezone.utc) if request.form.get("occurred_at") else datetime.now(timezone.utc)
+        except (ValueError, InvalidOperation):
+            return "Invalid Wallet amount", 400
+        if amount <= 0:
+            return "Invalid Wallet amount", 400
+        db = connect(app.config["SIPD_DB"])
+        try:
+            try:
+                with transaction(db):
+                    asset = ensure_wallet(db, user.id)
+                    calculate_position(ledger_entries(db, user.id, asset["id"]) + [LedgerEntry(0, kind, amount, Decimal("1"), Decimal("1"), occurred_at)])
+                    db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,notes,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?)", (user.id, asset["id"], kind, str(amount), "1", "IDR", "1", occurred_at.isoformat().replace("+00:00", "Z"), request.form.get("notes", "").strip(), key))
+                    db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset["id"], "1", "IDR", "Transaction", occurred_at.isoformat().replace("+00:00", "Z")))
+            except ValueError as error:
+                return str(error), 400
+            except Exception as error:
+                if "UNIQUE constraint failed" in str(error):
+                    return redirect("/wallet", 303)
+                raise
+        finally:
+            db.close()
+        return redirect("/wallet", 303)
+
+    @app.post("/wallet/top-up")
+    @require_user
+    def wallet_top_up():
+        return wallet_adjust("deposit")
+
+    @app.post("/wallet/withdraw")
+    @require_user
+    def wallet_withdraw():
+        return wallet_adjust("withdrawal")
+
     @app.get("/assets")
     @require_user
     def assets():

@@ -153,6 +153,19 @@ def test_wallet_renames_legacy_rdn_wallet_type(client, existing_session, app):
         db.close()
 
 
+def test_wallet_top_up_and_withdraw_update_balance(client, existing_session):
+    client.set_cookie("sipd_session", existing_session)
+    assert client.post("/wallet/top-up", data={"csrf_token": "csrf", "amount": "100000", "idempotency_key": "top"}).status_code == 303
+    assert client.post("/wallet/withdraw", data={"csrf_token": "csrf", "amount": "25000", "idempotency_key": "withdraw"}).status_code == 303
+    assert "75,000.00 IDR" in client.get("/wallet").text
+
+
+def test_wallet_withdraw_rejects_insufficient_balance(client, existing_session):
+    client.set_cookie("sipd_session", existing_session)
+    response = client.post("/wallet/withdraw", data={"csrf_token": "csrf", "amount": "1", "idempotency_key": "empty"})
+    assert response.status_code == 400
+
+
 def test_transactions_list_renders_without_asset_detail_context(client, existing_session, app):
     db = connect(app.config["SIPD_DB"])
     try:
