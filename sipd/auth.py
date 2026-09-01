@@ -16,6 +16,7 @@ class User:
     username: str
     csrf: str
     currency: str
+    language: str
 
 
 def session_hash(token: str) -> str:
@@ -32,7 +33,7 @@ def current_user() -> User | None:
     db = connect(current_app.config["SIPD_DB"])
     try:
         row = db.execute(
-            """SELECT u.id,u.username,s.csrf_token,us.display_currency,s.expires_at
+            """SELECT u.id,u.username,s.csrf_token,us.display_currency,us.language,s.expires_at
                FROM sessions s JOIN users u ON u.id=s.user_id
                JOIN user_settings us ON us.user_id=u.id WHERE s.id_hash=?""",
             (session_hash(token),),
@@ -42,7 +43,7 @@ def current_user() -> User | None:
     if not row or row["expires_at"] <= datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"):
         g.user = None
     else:
-        g.user = User(row["id"], row["username"], row["csrf_token"], row["display_currency"])
+        g.user = User(row["id"], row["username"], row["csrf_token"], row["display_currency"], row["language"])
     return g.user
 
 

@@ -9,15 +9,22 @@ from flask import jsonify, make_response, redirect, render_template, render_temp
 from sipd.auth import anon_token, create_session, current_user, delete_session, require_user, valid_anon_csrf, valid_user_csrf
 from sipd.db import connect, transaction
 from sipd.domain import LedgerEntry, calculate_position
+from sipd.i18n import translate
 from sipd.providers import quote_for_asset, usd_idr_quote, yahoo_quotes
 
 
 def user_page(view, title, **context):
     user = current_user()
-    return render_template("page.html", view=view, title=title, user=user, csrf=user.csrf, currency=user.currency, **context)
+    return render_template("page.html", view=view, title=title, user=user, csrf=user.csrf, currency=user.currency, language=user.language, _=lambda key: translate(user.language, key), **context)
 
 
 def register_routes(app):
+    @app.context_processor
+    def inject_i18n():
+        user = current_user()
+        language = user.language if user else "ID"
+        return {"_": lambda key: translate(language, key), "language": language}
+
     def ledger_entries(db, user_id, asset_id, omit_id=0):
         rows = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? AND id<>? ORDER BY occurred_at,id", (user_id, asset_id, omit_id)).fetchall()
         return [LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in rows]
@@ -127,7 +134,8 @@ def register_routes(app):
         top = [dict(holding, value=money(holding["market_value"]), percent=f"{(holding['market_value'] / total * 100) if total else Decimal():.1f}") for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)[:3]]
         for holding in holdings:
             holding.update(value=money(holding["market_value"]), unrealized_display=money(holding["unrealized"]), performance="gain" if holding["unrealized"] > 0 else "loss" if holding["unrealized"] < 0 else "")
-        return user_page("dashboard", "Dashboard", holdings=holdings, top=top, total=money(total), net_invested=money(net_invested), realized=money(realized), unrealized=money(unrealized), total_return=f"{((realized + unrealized) / net_invested * 100) if net_invested else Decimal():.1f}", type_alloc=[allocation(name, value) for name, value in sorted(type_totals.items(), key=lambda item: item[1], reverse=True)], asset_alloc=[allocation(holding["name"], holding["market_value"]) for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)], snapshots=[{"created_at": row["created_at"], "value": money(Decimal(row["total_value_idr"]))} for row in snapshots], refresh=refresh, refresh_key=secrets.token_urlsafe(18))
+        refresh_errors = [part.strip() for part in (refresh["error_summary"] if refresh else "").split(";") if part.strip()]
+        return user_page("dashboard", "Dashboard", holdings=holdings, top=top, total=money(total), net_invested=money(net_invested), realized=money(realized), unrealized=money(unrealized), total_return=f"{((realized + unrealized) / net_invested * 100) if net_invested else Decimal():.1f}", type_alloc=[allocation(name, value) for name, value in sorted(type_totals.items(), key=lambda item: item[1], reverse=True)], asset_alloc=[allocation(holding["name"], holding["market_value"]) for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)], snapshots=[{"created_at": row["created_at"], "value": money(Decimal(row["total_value_idr"]))} for row in snapshots], refresh=refresh, refresh_errors=refresh_errors, refresh_key=secrets.token_urlsafe(18))
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
@@ -425,6 +433,21 @@ def register_routes(app):
         db = connect(app.config["SIPD_DB"])
         try:
             db.execute("UPDATE user_settings SET display_currency=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (currency, current_user().id))
+        finally:
+            db.close()
+        return redirect("/settings", 303)
+
+    @app.post("/settings/language")
+    @require_user
+    def language_save():
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        language = request.form.get("language")
+        if language not in {"ID", "EN"}:
+            return "Invalid language", 400
+        db = connect(app.config["SIPD_DB"])
+        try:
+            db.execute("UPDATE user_settings SET language=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (language, current_user().id))
         finally:
             db.close()
         return redirect("/settings", 303)
