@@ -42,6 +42,54 @@ def test_yahoo_quotes_reports_empty_close_without_pandas_error(monkeypatch):
     }
 
 
+def test_yahoo_chart_quote_uses_latest_valid_close(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "chart": {
+                    "result": [{
+                        "meta": {"currency": "IDR"},
+                        "timestamp": [1788224400, 1788310800],
+                        "indicators": {"quote": [{"close": [4100, 4200]}]},
+                    }]
+                }
+            }
+
+    monkeypatch.setattr(providers.requests, "get", lambda url, timeout: Response())
+    quote = providers.yahoo_chart_quote("BBRI.JK")
+
+    assert quote.price == Decimal("4200")
+    assert quote.currency == "IDR"
+    assert quote.source == "Yahoo Finance (chart)"
+
+
+def test_yahoo_chart_quote_reports_empty_data(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "chart": {
+                    "result": [{
+                        "meta": {"currency": "IDR"},
+                        "timestamp": [1788224400],
+                        "indicators": {"quote": [{"close": [None]}]},
+                    }]
+                }
+            }
+
+    monkeypatch.setattr(providers.requests, "get", lambda url, timeout: Response())
+
+    try:
+        providers.yahoo_chart_quote("BBRI.JK")
+    except ValueError as error:
+        assert str(error) == "Yahoo Finance returned no quote data"
+    else:
+        raise AssertionError("expected ValueError")
+
+
 def test_kraken_quote_normalizes_btc_alias(monkeypatch):
     class Response:
         status_code = 200

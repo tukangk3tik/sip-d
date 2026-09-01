@@ -14,6 +14,11 @@ def create_app(config: dict | None = None) -> Flask:
         SIPD_BASE_URL=os.environ.get("SIPD_BASE_URL", ""),
         SIPD_METALS_API_KEY=os.environ.get("SIPD_METALS_API_KEY", ""),
         SIPD_FINNHUB_API_KEY=os.environ.get("SIPD_FINNHUB_API_KEY", ""),
+        SIPD_QUOTE_CACHE_TTL_SECONDS=int(os.environ.get("SIPD_QUOTE_CACHE_TTL_SECONDS", "900")),
+        SIPD_QUOTE_BACKOFF_INITIAL_SECONDS=int(os.environ.get("SIPD_QUOTE_BACKOFF_INITIAL_SECONDS", "60")),
+        SIPD_QUOTE_BACKOFF_MAX_SECONDS=int(os.environ.get("SIPD_QUOTE_BACKOFF_MAX_SECONDS", "1800")),
+        SIPD_YAHOO_TIMEOUT_SECONDS=int(os.environ.get("SIPD_YAHOO_TIMEOUT_SECONDS", "6")),
+        SIPD_YAHOO_BATCH_SIZE=int(os.environ.get("SIPD_YAHOO_BATCH_SIZE", "64")),
     )
     app.config.from_mapping(config or {})
     init_db(app.config["SIPD_DB"])

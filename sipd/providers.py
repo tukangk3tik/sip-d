@@ -47,6 +47,32 @@ def yahoo_quotes(symbols: tuple[str, ...]):
     return _cached_yahoo_quotes(tuple(sorted(symbols)), int(time.time() // 30))
 
 
+def yahoo_chart_quote(symbol: str, *, timeout: int = 6):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?" + urlencode({"range": "5d", "interval": "1d"})
+    response = requests.get(url, timeout=timeout)
+    if response.status_code != 200:
+        raise ValueError("Yahoo Finance is temporarily unavailable")
+    try:
+        result = response.json()["chart"]["result"][0]
+        currency = result["meta"]["currency"]
+        timestamps = result.get("timestamp") or []
+        closes = result["indicators"]["quote"][0]["close"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise ValueError("Yahoo Finance returned no quote data") from error
+    valid = [(timestamp, close) for timestamp, close in zip(timestamps, closes) if close is not None]
+    if not valid:
+        raise ValueError("Yahoo Finance returned no quote data")
+    timestamp, close = valid[-1]
+    try:
+        price = Decimal(str(close))
+        at = datetime.fromtimestamp(int(timestamp), timezone.utc)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Yahoo Finance returned no valid quote") from error
+    if price <= 0:
+        raise ValueError("Yahoo Finance returned no valid quote")
+    return Quote(price, currency, "Yahoo Finance (chart)", at)
+
+
 def _json(url):
     response = requests.get(url, timeout=6)
     if response.status_code != 200:
@@ -125,5 +151,8 @@ def quote_for_asset(asset, *, metals_key="", finnhub_key=""):
         quotes, errors = yahoo_quotes((asset["provider_symbol"],))
         if asset["provider_symbol"] in quotes:
             return quotes[asset["provider_symbol"]]
-        raise ValueError(errors.get(asset["provider_symbol"], "Yahoo Finance returned no valid quote"))
+        try:
+            return yahoo_chart_quote(asset["provider_symbol"])
+        except ValueError as error:
+            raise ValueError(str(error) or errors.get(asset["provider_symbol"], "Yahoo Finance returned no valid quote")) from error
     raise ValueError("automatic provider unavailable")
