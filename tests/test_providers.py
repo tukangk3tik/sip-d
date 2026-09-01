@@ -7,6 +7,8 @@ from sipd import providers
 
 
 def test_yahoo_quotes_batches_final_close(monkeypatch):
+    providers._cached_yahoo_quotes.cache_clear()
+
     def fake_download(*args, **kwargs):
         return pd.DataFrame({
             ("BBRI.JK", "Close"): [4100, 4200],
@@ -19,6 +21,25 @@ def test_yahoo_quotes_batches_final_close(monkeypatch):
     assert quotes["BBRI.JK"].price == Decimal("4200")
     assert quotes["BMRI.JK"].price == Decimal("5100")
     assert errors == {}
+
+
+def test_yahoo_quotes_reports_empty_close_without_pandas_error(monkeypatch):
+    providers._cached_yahoo_quotes.cache_clear()
+
+    def fake_download(*args, **kwargs):
+        return pd.DataFrame({
+            ("BBRI.JK", "Close"): [],
+            ("BMRI.JK", "Close"): [],
+        })
+
+    monkeypatch.setattr(providers.yf, "download", fake_download)
+    quotes, errors = providers.yahoo_quotes(("BBRI.JK", "BMRI.JK"))
+
+    assert quotes == {}
+    assert errors == {
+        "BBRI.JK": "Yahoo Finance returned no quote data",
+        "BMRI.JK": "Yahoo Finance returned no quote data",
+    }
 
 
 def test_kraken_quote_normalizes_btc_alias(monkeypatch):
