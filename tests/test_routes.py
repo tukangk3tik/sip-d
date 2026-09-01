@@ -65,6 +65,100 @@ def test_asset_edit_and_archive_routes(client, existing_session, app):
         db.close()
 
 
+def test_assets_list_renders_status_badges_and_actions(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,active) VALUES(1,1,'Cash','IDR','IDR','fixed',1)")
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,active) VALUES(1,1,'Old fund','unit','IDR','manual',0)")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+    page = client.get("/assets")
+
+    assert "status-badge active" in page.text
+    assert "status-badge inactive" in page.text
+    assert "/assets/1/deactivate" in page.text
+    assert "/assets/2/activate" in page.text
+    assert "inactive-row" in page.text
+
+
+def test_asset_can_be_deactivated_and_reactivated_from_list(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Cash','IDR','IDR','fixed')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+
+    assert client.post("/assets/1/deactivate", data={"csrf_token": "csrf"}).status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT active FROM assets WHERE id=1").fetchone()[0] == 0
+    finally:
+        db.close()
+
+    assert client.post("/assets/1/activate", data={"csrf_token": "csrf"}).status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT active FROM assets WHERE id=1").fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_asset_status_toggle_is_owned_and_csrf_protected(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO users(username,password_hash) VALUES('other','hash')")
+        db.execute("INSERT INTO user_settings(user_id) VALUES(2)")
+        db.execute("INSERT INTO investment_types(user_id,name) VALUES(2,'Cash')")
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(2,2,'Other','IDR','IDR','fixed')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+
+    assert client.post("/assets/1/deactivate", data={"csrf_token": "wrong"}).status_code == 403
+    assert client.post("/assets/1/deactivate", data={"csrf_token": "csrf"}).status_code == 404
+
+
+def test_wallet_asset_cannot_be_deactivated(client, existing_session, app):
+    client.set_cookie("sipd_session", existing_session)
+    assert client.get("/wallet").status_code == 200
+    db = connect(app.config["SIPD_DB"])
+    try:
+        wallet_id = db.execute("SELECT id FROM assets WHERE user_id=1 AND name='RDN'").fetchone()[0]
+    finally:
+        db.close()
+
+    assert client.post(f"/assets/{wallet_id}/deactivate", data={"csrf_token": "csrf"}).status_code == 400
+
+
+def test_inactive_asset_is_excluded_from_dashboard(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,active) VALUES(1,1,'Hidden','unit','IDR','manual',0)")
+        db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,idempotency_key) VALUES(1,1,'deposit','1','100','IDR','1','2026-08-26T12:00:00Z','hidden')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+
+    page = client.get("/")
+    assert "Hidden" not in page.text
+
+
+def test_inactive_automatic_asset_is_excluded_from_refresh(client, existing_session, app, monkeypatch):
+    from sipd import routes
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,provider,provider_symbol,active) VALUES(1,1,'Hidden','share','IDR','automatic','yahoo','HIDE.JK',0)")
+    finally:
+        db.close()
+    monkeypatch.setattr(routes, "yahoo_quotes", lambda symbols: (_ for _ in ()).throw(AssertionError("inactive asset should not refresh")))
+    monkeypatch.setattr(routes, "usd_idr_quote", lambda: Quote(Decimal("16500"), "IDR", "Frankfurter", datetime.now(timezone.utc)))
+    client.set_cookie("sipd_session", existing_session)
+
+    assert client.post("/refresh", data={"csrf_token": "csrf", "refresh_key": "inactive"}).status_code == 303
+
+
 def test_transaction_saves_for_owned_asset(client, existing_session, app):
     db = connect(app.config["SIPD_DB"])
     try:
@@ -112,6 +206,50 @@ def test_settings_language_update_is_owned(client, existing_session, app):
         assert db.execute("SELECT language FROM user_settings WHERE user_id=1").fetchone()[0] == "EN"
     finally:
         db.close()
+
+
+def test_language_toggle_redirects_back_to_safe_page(client, existing_session, app):
+    client.set_cookie("sipd_session", existing_session)
+    response = client.post("/settings/language", data={"csrf_token": "csrf", "language": "EN", "next": "/assets"})
+
+    assert response.status_code == 303
+    assert response.headers["Location"] == "/assets"
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT language FROM user_settings WHERE user_id=1").fetchone()[0] == "EN"
+    finally:
+        db.close()
+
+
+def test_language_toggle_rejects_external_next_redirect(client, existing_session):
+    client.set_cookie("sipd_session", existing_session)
+
+    response = client.post("/settings/language", data={"csrf_token": "csrf", "language": "EN", "next": "https://example.com"})
+    assert response.status_code == 303
+    assert response.headers["Location"] == "/settings"
+
+    response = client.post("/settings/language", data={"csrf_token": "csrf", "language": "ID", "next": "//example.com"})
+    assert response.status_code == 303
+    assert response.headers["Location"] == "/settings"
+
+
+def test_sidebar_renders_language_toggle(client, existing_session, app):
+    client.set_cookie("sipd_session", existing_session)
+    page = client.get("/assets")
+
+    assert 'class="language-toggle"' in page.text
+    assert 'name="language" value="ID"' in page.text
+    assert 'name="language" value="EN"' in page.text
+    assert 'name="next" value="/assets"' in page.text
+    assert 'value="ID" class="secondary active"' in page.text
+
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("UPDATE user_settings SET language='EN' WHERE user_id=1")
+    finally:
+        db.close()
+    page = client.get("/assets")
+    assert 'value="EN" class="secondary active"' in page.text
 
 
 def test_dashboard_renders_jinja_navigation(client, existing_session):

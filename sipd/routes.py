@@ -66,6 +66,31 @@ def register_routes(app):
             (user_id, asset["id"], str(quote.price), quote.currency, quote.source, as_db_time(quote.at)),
         )
 
+    def safe_next(default="/settings"):
+        target = request.form.get("next", "")
+        if target.startswith("/") and not target.startswith("//") and "\n" not in target and "\r" not in target:
+            return target
+        return default
+
+    def asset_status_save(asset_id, active):
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        user = current_user()
+        db = connect(app.config["SIPD_DB"])
+        try:
+            asset = db.execute(
+                "SELECT a.id,a.name,t.name type_name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.id=? AND a.user_id=?",
+                (asset_id, user.id),
+            ).fetchone()
+            if not asset:
+                return "Not found", 404
+            if not active and (asset["name"] == "RDN" or asset["type_name"] == "Wallet"):
+                return "Wallet cannot be deactivated", 400
+            db.execute("UPDATE assets SET active=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", (1 if active else 0, asset_id, user.id))
+        finally:
+            db.close()
+        return redirect("/assets", 303)
+
     def allow_login():
         attempts = app.extensions.setdefault("sipd_login_attempts", {})
         ip, cutoff = request.remote_addr or "", time.monotonic() - 900
@@ -290,14 +315,17 @@ def register_routes(app):
     @app.post("/assets/<int:asset_id>/archive")
     @require_user
     def asset_archive(asset_id):
-        if not valid_user_csrf():
-            return "Invalid CSRF token", 403
-        db = connect(app.config["SIPD_DB"])
-        try:
-            result = db.execute("UPDATE assets SET active=0,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", (asset_id, current_user().id))
-        finally:
-            db.close()
-        return redirect("/assets", 303) if result.rowcount else ("Not found", 404)
+        return asset_status_save(asset_id, False)
+
+    @app.post("/assets/<int:asset_id>/deactivate")
+    @require_user
+    def asset_deactivate(asset_id):
+        return asset_status_save(asset_id, False)
+
+    @app.post("/assets/<int:asset_id>/activate")
+    @require_user
+    def asset_activate(asset_id):
+        return asset_status_save(asset_id, True)
 
     @app.get("/assets/<int:asset_id>")
     @require_user
@@ -460,7 +488,7 @@ def register_routes(app):
             db.execute("UPDATE user_settings SET language=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (language, current_user().id))
         finally:
             db.close()
-        return redirect("/settings", 303)
+        return redirect(safe_next("/settings"), 303)
 
     @app.post("/settings/types")
     @app.post("/settings/types/<int:type_id>")
