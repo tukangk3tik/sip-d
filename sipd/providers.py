@@ -23,6 +23,8 @@ def _map_final_closes(frame, symbols):
         try:
             close = frame[(symbol, "Close")] if len(symbols) > 1 else frame["Close"]
             close = close.dropna()
+            if close.empty:
+                raise ValueError("Yahoo Finance returned no quote data")
             price = Decimal(str(close.iloc[-1]))
             if price <= 0:
                 raise ValueError("Yahoo Finance returned no valid quote")
