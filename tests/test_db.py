@@ -10,5 +10,7 @@ def test_existing_migration_creates_current_schema(tmp_path):
     try:
         columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
         assert {"id", "username", "password_hash"} <= columns
+        settings_columns = {row["name"] for row in db.execute("PRAGMA table_info(user_settings)")}
+        assert "language" in settings_columns
     finally:
         db.close()

@@ -103,6 +103,17 @@ def test_settings_currency_update_is_owned(client, existing_session, app):
         db.close()
 
 
+def test_settings_language_update_is_owned(client, existing_session, app):
+    client.set_cookie("sipd_session", existing_session)
+    response = client.post("/settings/language", data={"csrf_token": "csrf", "language": "EN"})
+    assert response.status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT language FROM user_settings WHERE user_id=1").fetchone()[0] == "EN"
+    finally:
+        db.close()
+
+
 def test_dashboard_renders_jinja_navigation(client, existing_session):
     client.set_cookie("sipd_session", existing_session)
     page = client.get("/")
@@ -131,10 +142,44 @@ def test_dashboard_renders_portfolio_summary(client, existing_session, app):
         db.close()
     client.set_cookie("sipd_session", existing_session)
     page = client.get("/")
-    assert "Total value" in page.text
-    assert "Net invested" in page.text
-    assert "Allocation by asset" in page.text
+    assert "Total nilai" in page.text
+    assert "Modal bersih" in page.text
+    assert "Alokasi berdasarkan aset" in page.text
     assert "Cash" in page.text
+
+
+def test_dashboard_uses_indonesian_by_default_with_card_lists(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Cash','IDR','IDR','fixed')")
+        db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,idempotency_key) VALUES(1,1,'deposit','10','1','IDR','1','2026-08-26T12:00:00Z','cards')")
+        db.execute("INSERT INTO price_refreshes(user_id,refresh_key,status,error_summary,created_at) VALUES(1,'refresh','partial','BBCA failed; BTC failed','2026-08-27T12:00:00Z')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+    page = client.get("/")
+
+    assert '<html lang="id">' in page.text
+    assert "Aset terbesar" in page.text
+    assert "Status penyegaran" in page.text
+    assert "largest-card" in page.text
+    assert "refresh-card" in page.text
+    assert "BBCA failed" in page.text
+    assert "BTC failed" in page.text
+
+
+def test_dashboard_uses_english_when_selected(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("UPDATE user_settings SET language='EN' WHERE user_id=1")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+    page = client.get("/")
+
+    assert '<html lang="en">' in page.text
+    assert "Largest assets" in page.text
+    assert "Aset terbesar" not in page.text
 
 
 def test_wallet_page_provisions_fixed_idr_wallet(client, existing_session, app):
