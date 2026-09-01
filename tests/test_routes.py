@@ -418,6 +418,68 @@ def test_refresh_saves_batched_yahoo_price(client, existing_session, app, monkey
         db.close()
 
 
+def test_refresh_uses_fresh_quote_cache_without_provider_call(client, existing_session, app, monkeypatch):
+    from sipd import routes
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,provider,provider_symbol) VALUES(1,1,'BBRI','share','IDR','automatic','yahoo','BBRI.JK')")
+        db.execute("""INSERT INTO quote_cache(provider,symbol,price,currency,source,fetched_at)
+                      VALUES('yahoo','BBRI.JK','4100','IDR','Yahoo Finance (yfinance)','2099-01-01T00:00:00Z')""")
+    finally:
+        db.close()
+    monkeypatch.setattr(routes, "yahoo_quotes", lambda symbols: (_ for _ in ()).throw(AssertionError("provider should not be called")))
+    client.set_cookie("sipd_session", existing_session)
+    assert client.post("/refresh", data={"csrf_token": "csrf", "refresh_key": "cache"}).status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT price FROM asset_prices WHERE asset_id=1").fetchone()[0] == "4100"
+        assert "Menggunakan harga cache" in db.execute("SELECT error_summary FROM price_refreshes WHERE refresh_key='cache'").fetchone()[0]
+    finally:
+        db.close()
+
+
+def test_refresh_falls_back_to_direct_yahoo_chart(client, existing_session, app, monkeypatch):
+    from sipd import routes
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,provider,provider_symbol) VALUES(1,1,'BBRI','share','IDR','automatic','yahoo','BBRI.JK')")
+    finally:
+        db.close()
+    monkeypatch.setattr(routes, "yahoo_quotes", lambda symbols: ({}, {"BBRI.JK": "Yahoo Finance returned no quote data"}))
+    monkeypatch.setattr(routes, "yahoo_chart_quote", lambda symbol, timeout: Quote(Decimal("4300"), "IDR", "Yahoo Finance (chart)", datetime.now(timezone.utc)))
+    client.set_cookie("sipd_session", existing_session)
+    assert client.post("/refresh", data={"csrf_token": "csrf", "refresh_key": "chart"}).status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        row = db.execute("SELECT price,source FROM asset_prices WHERE asset_id=1").fetchone()
+        assert tuple(row) == ("4300", "Yahoo Finance (chart)")
+        assert db.execute("SELECT failure_count FROM quote_cache WHERE symbol='BBRI.JK'").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_refresh_skips_yahoo_symbol_during_backoff(client, existing_session, app, monkeypatch):
+    from sipd import routes
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode,provider,provider_symbol) VALUES(1,1,'BBRI','share','IDR','automatic','yahoo','BBRI.JK')")
+        db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(1,1,'4100','IDR','Yahoo Finance (yfinance)','2026-09-01T06:00:00Z')")
+        db.execute("""INSERT INTO quote_cache(provider,symbol,error,error_at,failure_count,backoff_until)
+                      VALUES('yahoo','BBRI.JK','Yahoo Finance returned no quote data','2026-09-01T06:01:00Z',2,'2099-01-01T00:00:00Z')""")
+    finally:
+        db.close()
+    monkeypatch.setattr(routes, "yahoo_quotes", lambda symbols: (_ for _ in ()).throw(AssertionError("provider should not be called")))
+    client.set_cookie("sipd_session", existing_session)
+    assert client.post("/refresh", data={"csrf_token": "csrf", "refresh_key": "backoff"}).status_code == 303
+    db = connect(app.config["SIPD_DB"])
+    try:
+        row = db.execute("SELECT status,error_summary FROM price_refreshes WHERE refresh_key='backoff'").fetchone()
+        assert row["status"] == "partial"
+        assert "Penyedia sementara tidak tersedia; Menggunakan harga terakhir" in row["error_summary"]
+    finally:
+        db.close()
+
+
 def test_exchange_rate_uses_last_known_rate_when_provider_fails(client, existing_session, app, monkeypatch):
     from sipd import routes
     db = connect(app.config["SIPD_DB"])
