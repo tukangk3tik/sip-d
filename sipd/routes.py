@@ -14,9 +14,21 @@ from sipd.providers import quote_for_asset, usd_idr_quote, yahoo_chart_quote, ya
 from sipd.repositories import as_db_time, cached_quote_to_quote, get_cached_quote, parse_db_time, record_quote_failure, save_cached_quote
 
 
+def format_number(value):
+    if value is None or value == "":
+        return ""
+    text = format(value, "f") if isinstance(value, Decimal) else str(value)
+    sign = "-" if text.startswith("-") else ""
+    if sign:
+        text = text[1:]
+    integer, dot, fractional = text.partition(".")
+    grouped = f"{int(integer or '0'):,}" if integer.isdigit() else integer
+    return f"{sign}{grouped}{dot}{fractional}"
+
+
 def user_page(view, title, **context):
     user = current_user()
-    return render_template("page.html", view=view, title=title, user=user, csrf=user.csrf, currency=user.currency, language=user.language, _=lambda key: translate(user.language, key), **context)
+    return render_template("page.html", view=view, title=title, user=user, csrf=user.csrf, currency=user.currency, language=user.language, _=lambda key: translate(user.language, key), number=format_number, **context)
 
 
 def register_routes(app):
