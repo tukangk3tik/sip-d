@@ -80,8 +80,8 @@ def test_assets_page_renders_latest_price_column(client, existing_session, app):
 
     assert page.status_code == 200
     assert "<th>Harga</th><th>Harga</th><th>Status aset</th>" in page.text
-    assert "4200 IDR" in page.text
-    assert "4100 IDR" not in page.text
+    assert "4,200 IDR" in page.text
+    assert "4,100 IDR" not in page.text
     assert "1 IDR" in page.text
 
 
@@ -481,14 +481,27 @@ def test_deleting_asset_buy_removes_wallet_pair(client, existing_session, app):
 def test_transactions_list_renders_without_asset_detail_context(client, existing_session, app):
     db = connect(app.config["SIPD_DB"])
     try:
-        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Cash','IDR','IDR','fixed')")
-        db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,idempotency_key) VALUES(1,1,'deposit','1','1','IDR','1','2026-08-26T12:00:00Z','list')")
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Fund','unit','IDR','manual')")
+        db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,idempotency_key) VALUES(1,1,'deposit','12345.678','98765.4321','IDR','1','2026-08-26T12:00:00Z','list')")
+        db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(1,1,'98765.4321','IDR','Transaction','2026-08-26T12:00:00Z')")
     finally:
         db.close()
     client.set_cookie("sipd_session", existing_session)
     page = client.get("/transactions")
     assert page.status_code == 200
-    assert "Cash" in page.text
+    assert "Fund" in page.text
+    assert "12,345.678" in page.text
+    assert "98,765.4321 IDR" in page.text
+    assert "12345.678" not in page.text
+
+    page = client.get("/transactions/1")
+    assert page.status_code == 200
+    assert "12,345.678" in page.text
+    assert "98,765.4321 IDR" in page.text
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "12,345.678 unit" in page.text
 
 
 def test_ticker_lookup_route_and_static_assets(client, existing_session):
@@ -498,6 +511,19 @@ def test_ticker_lookup_route_and_static_assets(client, existing_session):
     assert css.status_code == 200
     assert ".sidebar{display:flex;flex-direction:column" in css.text
     assert client.get("/static/webawesome/styles/webawesome.css").status_code == 200
+
+
+def test_ticker_lookup_renders_price_with_thousand_separator(client, existing_session, monkeypatch):
+    from sipd import routes
+
+    client.set_cookie("sipd_session", existing_session)
+    monkeypatch.setattr(routes, "yahoo_quotes", lambda symbols: ({"BBRI.JK": Quote(Decimal("12345.67"), "IDR", "Yahoo Finance", datetime.now(timezone.utc))}, {}))
+
+    page = client.get("/settings/tickers?provider=yahoo&q=BBRI.JK")
+
+    assert page.status_code == 200
+    assert "12,345.67 IDR" in page.text
+    assert "12345.67 IDR" not in page.text
 
 
 def test_refresh_creates_idempotent_snapshot_for_fixed_asset(client, existing_session, app):
