@@ -238,7 +238,21 @@ def register_routes(app):
     def assets():
         db = connect(app.config["SIPD_DB"])
         try:
-            rows = db.execute("SELECT a.*,t.name type_name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.user_id=? ORDER BY a.active DESC,t.name,a.name", (current_user().id,)).fetchall()
+            rows = db.execute(
+                """SELECT a.*,t.name type_name,
+                          CASE WHEN a.pricing_mode='fixed' THEN COALESCE(p.price,'1') ELSE p.price END latest_price,
+                          CASE WHEN a.pricing_mode='fixed' THEN COALESCE(p.currency,a.quote_currency) ELSE p.currency END latest_price_currency
+                   FROM assets a
+                   JOIN investment_types t ON t.id=a.investment_type_id
+                   LEFT JOIN asset_prices p ON p.id=(
+                       SELECT id FROM asset_prices
+                       WHERE user_id=a.user_id AND asset_id=a.id
+                       ORDER BY priced_at DESC,id DESC LIMIT 1
+                   )
+                   WHERE a.user_id=?
+                   ORDER BY a.active DESC,t.name,a.name""",
+                (current_user().id,),
+            ).fetchall()
         finally:
             db.close()
         return user_page("assets", "Assets", assets=rows)
