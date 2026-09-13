@@ -23,6 +23,7 @@ TRANSLATIONS = {
         "Name": "Nama",
         "Type": "Tipe",
         "Pricing": "Harga",
+        "Price": "Harga",
         "Actions": "Aksi",
         "Quantity": "Jumlah",
         "Value": "Nilai",

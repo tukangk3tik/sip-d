@@ -65,6 +65,26 @@ def test_asset_edit_and_archive_routes(client, existing_session, app):
         db.close()
 
 
+def test_assets_page_renders_latest_price_column(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'BBRI','share','IDR','automatic')")
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Cash','IDR','IDR','fixed')")
+        db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(1,1,'4100','IDR','old','2026-08-26T12:00:00Z')")
+        db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(1,1,'4200','IDR','new','2026-08-27T12:00:00Z')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+
+    page = client.get("/assets")
+
+    assert page.status_code == 200
+    assert "<th>Harga</th><th>Harga</th><th>Status aset</th>" in page.text
+    assert "4200 IDR" in page.text
+    assert "4100 IDR" not in page.text
+    assert "1 IDR" in page.text
+
+
 def test_assets_list_renders_status_badges_and_actions(client, existing_session, app):
     db = connect(app.config["SIPD_DB"])
     try:
