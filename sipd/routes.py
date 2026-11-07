@@ -9,15 +9,35 @@ from flask import jsonify, make_response, redirect, render_template, render_temp
 from sipd.auth import anon_token, create_session, current_user, delete_session, require_user, valid_anon_csrf, valid_user_csrf
 from sipd.db import connect, transaction
 from sipd.domain import LedgerEntry, calculate_position
-from sipd.providers import quote_for_asset, usd_idr_quote, yahoo_quotes
+from sipd.i18n import translate
+from sipd.providers import quote_for_asset, usd_idr_quote, yahoo_chart_quote, yahoo_quotes
+from sipd.repositories import as_db_time, cached_quote_to_quote, get_cached_quote, parse_db_time, record_quote_failure, save_cached_quote
+
+
+def format_number(value):
+    if value is None or value == "":
+        return ""
+    text = format(value, "f") if isinstance(value, Decimal) else str(value)
+    sign = "-" if text.startswith("-") else ""
+    if sign:
+        text = text[1:]
+    integer, dot, fractional = text.partition(".")
+    grouped = f"{int(integer or '0'):,}" if integer.isdigit() else integer
+    return f"{sign}{grouped}{dot}{fractional}"
 
 
 def user_page(view, title, **context):
     user = current_user()
-    return render_template("page.html", view=view, title=title, user=user, csrf=user.csrf, currency=user.currency, **context)
+    return render_template("page.html", view=view, title=title, user=user, csrf=user.csrf, currency=user.currency, language=user.language, _=lambda key: translate(user.language, key), number=format_number, **context)
 
 
 def register_routes(app):
+    @app.context_processor
+    def inject_i18n():
+        user = current_user()
+        language = user.language if user else "ID"
+        return {"_": lambda key: translate(language, key), "language": language}
+
     def ledger_entries(db, user_id, asset_id, omit_id=0):
         rows = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? AND id<>? ORDER BY occurred_at,id", (user_id, asset_id, omit_id)).fetchall()
         return [LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in rows]
@@ -48,6 +68,40 @@ def register_routes(app):
     def rebuild_transaction_prices(db, user_id, asset_id):
         db.execute("DELETE FROM asset_prices WHERE user_id=? AND asset_id=? AND source='Transaction'", (user_id, asset_id))
         db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) SELECT user_id,asset_id,unit_price,quote_currency,'Transaction',occurred_at FROM transactions WHERE user_id=? AND asset_id=?", (user_id, asset_id))
+
+    def latest_asset_price(db, user_id, asset_id):
+        return db.execute("SELECT price,currency,source,priced_at FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (user_id, asset_id)).fetchone()
+
+    def save_asset_quote(db, user_id, asset, quote):
+        db.execute(
+            "INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)",
+            (user_id, asset["id"], str(quote.price), quote.currency, quote.source, as_db_time(quote.at)),
+        )
+
+    def safe_next(default="/settings"):
+        target = request.form.get("next", "")
+        if target.startswith("/") and not target.startswith("//") and "\n" not in target and "\r" not in target:
+            return target
+        return default
+
+    def asset_status_save(asset_id, active):
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        user = current_user()
+        db = connect(app.config["SIPD_DB"])
+        try:
+            asset = db.execute(
+                "SELECT a.id,a.name,t.name type_name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.id=? AND a.user_id=?",
+                (asset_id, user.id),
+            ).fetchone()
+            if not asset:
+                return "Not found", 404
+            if not active and (asset["name"] == "RDN" or asset["type_name"] == "Wallet"):
+                return "Wallet cannot be deactivated", 400
+            db.execute("UPDATE assets SET active=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", (1 if active else 0, asset_id, user.id))
+        finally:
+            db.close()
+        return redirect("/assets", 303)
 
     def allow_login():
         attempts = app.extensions.setdefault("sipd_login_attempts", {})
@@ -127,7 +181,8 @@ def register_routes(app):
         top = [dict(holding, value=money(holding["market_value"]), percent=f"{(holding['market_value'] / total * 100) if total else Decimal():.1f}") for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)[:3]]
         for holding in holdings:
             holding.update(value=money(holding["market_value"]), unrealized_display=money(holding["unrealized"]), performance="gain" if holding["unrealized"] > 0 else "loss" if holding["unrealized"] < 0 else "")
-        return user_page("dashboard", "Dashboard", holdings=holdings, top=top, total=money(total), net_invested=money(net_invested), realized=money(realized), unrealized=money(unrealized), total_return=f"{((realized + unrealized) / net_invested * 100) if net_invested else Decimal():.1f}", type_alloc=[allocation(name, value) for name, value in sorted(type_totals.items(), key=lambda item: item[1], reverse=True)], asset_alloc=[allocation(holding["name"], holding["market_value"]) for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)], snapshots=[{"created_at": row["created_at"], "value": money(Decimal(row["total_value_idr"]))} for row in snapshots], refresh=refresh, refresh_key=secrets.token_urlsafe(18))
+        refresh_errors = [part.strip() for part in (refresh["error_summary"] if refresh else "").split(";") if part.strip()]
+        return user_page("dashboard", "Dashboard", holdings=holdings, top=top, total=money(total), net_invested=money(net_invested), realized=money(realized), unrealized=money(unrealized), total_return=f"{((realized + unrealized) / net_invested * 100) if net_invested else Decimal():.1f}", type_alloc=[allocation(name, value) for name, value in sorted(type_totals.items(), key=lambda item: item[1], reverse=True)], asset_alloc=[allocation(holding["name"], holding["market_value"]) for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)], snapshots=[{"created_at": row["created_at"], "value": money(Decimal(row["total_value_idr"]))} for row in snapshots], refresh=refresh, refresh_errors=refresh_errors, refresh_key=secrets.token_urlsafe(18))
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
@@ -220,7 +275,21 @@ def register_routes(app):
     def assets():
         db = connect(app.config["SIPD_DB"])
         try:
-            rows = db.execute("SELECT a.*,t.name type_name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.user_id=? ORDER BY a.active DESC,t.name,a.name", (current_user().id,)).fetchall()
+            rows = db.execute(
+                """SELECT a.*,t.name type_name,
+                          CASE WHEN a.pricing_mode='fixed' THEN COALESCE(p.price,'1') ELSE p.price END latest_price,
+                          CASE WHEN a.pricing_mode='fixed' THEN COALESCE(p.currency,a.quote_currency) ELSE p.currency END latest_price_currency
+                   FROM assets a
+                   JOIN investment_types t ON t.id=a.investment_type_id
+                   LEFT JOIN asset_prices p ON p.id=(
+                       SELECT id FROM asset_prices
+                       WHERE user_id=a.user_id AND asset_id=a.id
+                       ORDER BY priced_at DESC,id DESC LIMIT 1
+                   )
+                   WHERE a.user_id=?
+                   ORDER BY a.active DESC,t.name,a.name""",
+                (current_user().id,),
+            ).fetchall()
         finally:
             db.close()
         return user_page("assets", "Assets", assets=rows)
@@ -272,14 +341,17 @@ def register_routes(app):
     @app.post("/assets/<int:asset_id>/archive")
     @require_user
     def asset_archive(asset_id):
-        if not valid_user_csrf():
-            return "Invalid CSRF token", 403
-        db = connect(app.config["SIPD_DB"])
-        try:
-            result = db.execute("UPDATE assets SET active=0,updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?", (asset_id, current_user().id))
-        finally:
-            db.close()
-        return redirect("/assets", 303) if result.rowcount else ("Not found", 404)
+        return asset_status_save(asset_id, False)
+
+    @app.post("/assets/<int:asset_id>/deactivate")
+    @require_user
+    def asset_deactivate(asset_id):
+        return asset_status_save(asset_id, False)
+
+    @app.post("/assets/<int:asset_id>/activate")
+    @require_user
+    def asset_activate(asset_id):
+        return asset_status_save(asset_id, True)
 
     @app.get("/assets/<int:asset_id>")
     @require_user
@@ -429,6 +501,21 @@ def register_routes(app):
             db.close()
         return redirect("/settings", 303)
 
+    @app.post("/settings/language")
+    @require_user
+    def language_save():
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        language = request.form.get("language")
+        if language not in {"ID", "EN"}:
+            return "Invalid language", 400
+        db = connect(app.config["SIPD_DB"])
+        try:
+            db.execute("UPDATE user_settings SET language=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (language, current_user().id))
+        finally:
+            db.close()
+        return redirect(safe_next("/settings"), 303)
+
     @app.post("/settings/types")
     @app.post("/settings/types/<int:type_id>")
     @require_user
@@ -492,22 +579,76 @@ def register_routes(app):
                 return redirect("/", 303)
             assets = db.execute("SELECT id,name,unit,pricing_mode,quote_currency,provider,provider_symbol FROM assets WHERE user_id=? AND active=1", (user.id,)).fetchall()
             yahoo_assets = [asset for asset in assets if asset["pricing_mode"] == "automatic" and asset["provider"] == "yahoo"]
-            quotes, provider_errors = yahoo_quotes(tuple(asset["provider_symbol"] for asset in yahoo_assets)) if yahoo_assets else ({}, {})
-            errors = []
+            now = datetime.now(timezone.utc)
+            ttl_seconds = int(app.config["SIPD_QUOTE_CACHE_TTL_SECONDS"])
+            details, errors, yahoo_live_assets = [], [], []
+            t = lambda key: translate(user.language, key)
             try:
                 rate = usd_idr_quote()
                 db.execute("INSERT INTO exchange_rates(user_id,base_currency,quote_currency,rate,source,priced_at) VALUES(?,'USD','IDR',?,?,?)", (user.id, str(rate.price), rate.source, rate.at.isoformat().replace("+00:00", "Z")))
             except ValueError as error:
                 errors.append(f"USD/IDR: {error}")
             for asset in yahoo_assets:
+                cached = get_cached_quote(db, "yahoo", asset["provider_symbol"])
+                quote = cached_quote_to_quote(cached)
+                fetched_at = parse_db_time(cached["fetched_at"]) if cached else None
+                backoff_until = parse_db_time(cached["backoff_until"]) if cached else None
+                if quote and fetched_at and (now - fetched_at).total_seconds() <= ttl_seconds and quote.currency == asset["quote_currency"] and quote.price > 0:
+                    save_asset_quote(db, user.id, asset, quote)
+                    details.append(f"{asset['name']}: {t('Using cached price')}")
+                    continue
+                if backoff_until and backoff_until > now:
+                    last = latest_asset_price(db, user.id, asset["id"])
+                    detail = f"{t('Provider temporarily unavailable')}; {t('Using last known price')}" if last else t("Provider temporarily unavailable")
+                    errors.append(f"{asset['name']}: {detail}")
+                    continue
+                yahoo_live_assets.append(asset)
+            quotes, provider_errors = {}, {}
+            batch_size = max(1, int(app.config["SIPD_YAHOO_BATCH_SIZE"]))
+            for start in range(0, len(yahoo_live_assets), batch_size):
+                symbols = tuple(asset["provider_symbol"] for asset in yahoo_live_assets[start:start + batch_size])
+                batch_quotes, batch_errors = yahoo_quotes(symbols)
+                quotes.update(batch_quotes)
+                provider_errors.update(batch_errors)
+            for asset in yahoo_assets:
+                if asset not in yahoo_live_assets:
+                    continue
                 quote = quotes.get(asset["provider_symbol"])
                 if not quote:
-                    errors.append(f"{asset['name']}: {provider_errors.get(asset['provider_symbol'], 'provider unavailable')}")
-                    continue
+                    try:
+                        quote = yahoo_chart_quote(asset["provider_symbol"], timeout=int(app.config["SIPD_YAHOO_TIMEOUT_SECONDS"]))
+                    except ValueError as error:
+                        message = str(error) or provider_errors.get(asset["provider_symbol"], "provider unavailable")
+                        record_quote_failure(
+                            db,
+                            "yahoo",
+                            asset["provider_symbol"],
+                            message,
+                            now=now,
+                            initial_seconds=int(app.config["SIPD_QUOTE_BACKOFF_INITIAL_SECONDS"]),
+                            max_seconds=int(app.config["SIPD_QUOTE_BACKOFF_MAX_SECONDS"]),
+                        )
+                        last = latest_asset_price(db, user.id, asset["id"])
+                        if last:
+                            errors.append(f"{asset['name']}: {t('Using last known price')}")
+                        else:
+                            errors.append(f"{asset['name']}: {message}")
+                        continue
                 if quote.price <= 0 or quote.currency != asset["quote_currency"]:
+                    record_quote_failure(
+                        db,
+                        "yahoo",
+                        asset["provider_symbol"],
+                        "provider returned invalid price",
+                        now=now,
+                        initial_seconds=int(app.config["SIPD_QUOTE_BACKOFF_INITIAL_SECONDS"]),
+                        max_seconds=int(app.config["SIPD_QUOTE_BACKOFF_MAX_SECONDS"]),
+                    )
                     errors.append(f"{asset['name']}: provider returned invalid price")
                     continue
-                db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset["id"], str(quote.price), quote.currency, quote.source, quote.at.isoformat().replace("+00:00", "Z")))
+                save_cached_quote(db, "yahoo", asset["provider_symbol"], quote)
+                save_asset_quote(db, user.id, asset, quote)
+                details.append(f"{asset['name']}: {t('Updated successfully')}")
             for asset in assets:
                 if asset["pricing_mode"] != "automatic" or asset["provider"] == "yahoo":
                     continue
@@ -541,7 +682,7 @@ def register_routes(app):
                 unrealized += value - position.cost_basis
                 snapshot_items.append((asset, position, price, fx_rate, value))
             status = "partial" if errors else "success"
-            db.execute("INSERT INTO price_refreshes(user_id,refresh_key,status,error_summary) VALUES(?,?,?,?)", (user.id, key, status, "; ".join(errors)))
+            db.execute("INSERT INTO price_refreshes(user_id,refresh_key,status,error_summary) VALUES(?,?,?,?)", (user.id, key, status, "; ".join(details + errors)))
             db.execute("INSERT INTO portfolio_snapshots(user_id,refresh_key,total_value_idr,net_invested_idr,realized_pl_idr,unrealized_pl_idr) VALUES(?,?,?,?,?,?)", (user.id, key, str(total), str(net_invested), str(realized), str(unrealized)))
             snapshot_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
             for asset, position, price, fx_rate, value in snapshot_items:
@@ -564,9 +705,14 @@ def register_routes(app):
         if asset["pricing_mode"] == "fixed":
             return jsonify(price="1", currency=asset["quote_currency"], source="Fixed", timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
         if asset["provider"] == "yahoo":
-            quotes, errors = yahoo_quotes((asset["provider_symbol"],))
+            quotes, _errors = yahoo_quotes((asset["provider_symbol"],))
             quote = quotes.get(asset["provider_symbol"])
-            if quote:
+            if not quote:
+                try:
+                    quote = yahoo_chart_quote(asset["provider_symbol"], timeout=int(app.config["SIPD_YAHOO_TIMEOUT_SECONDS"]))
+                except ValueError:
+                    quote = None
+            if quote and quote.price > 0 and quote.currency == asset["quote_currency"]:
                 return jsonify(price=str(quote.price), currency=quote.currency, source=quote.source, timestamp=quote.at.isoformat())
         else:
             try:

@@ -18,6 +18,9 @@ def init_db(path: str | Path) -> None:
     db = connect(path)
     try:
         db.executescript((Path(__file__).parents[1] / "migrations.sql").read_text())
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(user_settings)")}
+        if "language" not in columns:
+            db.execute("ALTER TABLE user_settings ADD COLUMN language TEXT NOT NULL DEFAULT 'ID' CHECK(language IN ('ID','EN'))")
     finally:
         db.close()
 
