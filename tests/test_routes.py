@@ -272,6 +272,15 @@ def test_sidebar_renders_language_toggle(client, existing_session, app):
     assert 'value="EN" class="secondary active"' in page.text
 
 
+def test_settings_investment_type_actions_are_compact(client, existing_session):
+    client.set_cookie("sipd_session", existing_session)
+
+    page = client.get("/settings")
+
+    assert 'action="/settings/types/1" style="display:flex;align-items:end;gap:10px;flex-wrap:wrap"' in page.text
+    assert 'style="flex:1 1 180px;max-width:360px"' in page.text
+
+
 def test_dashboard_renders_jinja_navigation(client, existing_session):
     client.set_cookie("sipd_session", existing_session)
     page = client.get("/")
