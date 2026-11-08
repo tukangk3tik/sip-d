@@ -7,3 +7,21 @@ const priceLookup=document.querySelector('#lookup-price');
 priceLookup?.addEventListener('click',async()=>{const form=priceLookup.closest('form'),asset=form.elements.asset_id.value,status=document.querySelector('#lookup-status');priceLookup.disabled=true;status.textContent='Loading…';try{const body=new URLSearchParams({csrf_token:form.elements.csrf_token.value});const response=await fetch('/api/assets/'+encodeURIComponent(asset)+'/price',{method:'POST',body});if(!response.ok)throw new Error('Price unavailable');const quote=await response.json();if(form.elements.asset_id.value===asset){form.elements.price.value=quote.price;status.textContent=quote.source+' · '+quote.timestamp;}}catch(error){status.textContent='Price unavailable. Enter a price manually.';}finally{priceLookup.disabled=false;}});
 document.querySelectorAll('form[action="/refresh"]').forEach(form=>form.addEventListener('submit',()=>{form.querySelector('button').disabled=true;}));
 addEventListener('pageshow',()=>{document.querySelectorAll('form[action="/refresh"] button').forEach(button=>button.disabled=false);});
+
+const aiTestDialog=document.querySelector('#ai-test-dialog');
+document.querySelectorAll('form[data-ai-test]').forEach(form=>form.addEventListener('submit',async event=>{
+  event.preventDefault();
+  const button=form.querySelector('button');
+  if(button.disabled)return;
+  button.disabled=true;
+  form.setAttribute('aria-busy','true');
+  let message=aiTestDialog.dataset.failure;
+  try{
+    const response=await fetch(form.action,{method:'POST',body:new FormData(form),headers:{Accept:'application/json'}});
+    const result=await response.json();
+    if(typeof result.message==='string')message=result.message;
+  }catch(error){/* Show the localized fallback without leaving Settings. */}
+  finally{button.disabled=false;form.removeAttribute('aria-busy');}
+  document.querySelector('#ai-test-message').textContent=message;
+  if(!aiTestDialog.open)aiTestDialog.showModal();
+}));

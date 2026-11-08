@@ -79,6 +79,8 @@ TRANSLATIONS["ID"].update({
     "Leave a key blank to keep the saved key.":"Kosongkan kunci untuk mempertahankan kunci tersimpan.",
     "Test connection (uses API credits)":"Uji koneksi (menggunakan kredit API)",
     "Remove key":"Hapus kunci", "Connection managed by the administrator.":"Koneksi dikelola administrator.",
+    "Connection test":"Uji koneksi", "Connection ready":"Koneksi siap", "Close":"Tutup",
+    "Connection unavailable; check key, model and provider limits":"Koneksi tidak tersedia; periksa kunci, model, dan batas layanan",
     "Lookup price":"Cari harga", "Quote source":"Sumber harga",
 })
 

@@ -1,3 +1,4 @@
+import pytest
 from datetime import datetime,timezone
 from decimal import Decimal
 from sipd.db import connect
@@ -35,3 +36,29 @@ def test_refresh_batches_owned_ai_prices_and_is_idempotent(app,client,existing_s
     assert db.execute('SELECT COUNT(*) FROM portfolio_snapshots').fetchone()[0]==1
     assert db.execute('SELECT status FROM price_refreshes').fetchone()[0]=='partial'
     db.close()
+
+
+@pytest.mark.parametrize('ok,message,status', [
+    (True, 'Connection ready', 200),
+    (False, 'Connection unavailable; check key, model and provider limits', 503),
+])
+def test_connection_result_returns_json_without_leaving_settings(app,client,admin_session,monkeypatch,ok,message,status):
+    from sipd import routes
+    client.set_cookie('sipd_session',admin_session)
+    monkeypatch.setattr(routes,'test_ai_connection',lambda *args,**kwargs: (ok,message))
+    response=client.post('/settings/ai/openai/test',data={'csrf_token':'csrf'},headers={'Accept':'application/json'})
+    assert response.status_code==status
+    assert response.is_json and response.get_json()['ok'] is ok
+    assert response.get_json()['message']
+    page=client.get('/settings').text
+    assert '<dialog' in page and 'id="ai-test-dialog"' in page
+    assert 'data-ai-test' in page
+
+
+def test_connection_test_without_javascript_returns_to_settings(client,admin_session,monkeypatch):
+    from sipd import routes
+    client.set_cookie('sipd_session',admin_session)
+    monkeypatch.setattr(routes,'test_ai_connection',lambda *args,**kwargs: (True,'Connection ready'))
+    response=client.post('/settings/ai/openai/test',data={'csrf_token':'csrf'})
+    assert response.status_code==303
+    assert response.headers['Location'].startswith('/settings?ai_test=success')
