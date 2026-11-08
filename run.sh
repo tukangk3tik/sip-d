@@ -9,4 +9,4 @@ fi
 find sipd tests -type d -name __pycache__ -prune -exec rm -rf {} +
 SIPD_DB=${SIPD_DB:-data/sip-d.db}
 export SIPD_DB
-exec .venv/bin/gunicorn --reload --bind "${SIPD_ADDR:-127.0.0.1:8090}" sipd.wsgi:app
+exec .venv/bin/gunicorn --workers 2 --timeout 180 --reload --bind "${SIPD_ADDR:-127.0.0.1:8090}" sipd.wsgi:app

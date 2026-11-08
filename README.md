@@ -139,3 +139,54 @@ Back up the database, build and test a new binary, then atomically replace `/opt
 - Partial refresh: successful prices remain updated and each failure appears on the dashboard.
 - USD display unavailable: run Refresh Prices to obtain USD/IDR.
 - Database busy: verify only one SIP-D process uses the database and that it resides on local storage.
+
+
+## Shared AI price retrieval
+
+Select **AI Scrape** on an automatic asset and enter an unambiguous provider
+symbol (for example `BBCA.JK`), quote currency, and unit (`share` for stocks).
+The original setup user is the administrator. On an existing database, the
+migration grants this role to the earliest-created user once. Other users can
+refresh their own assets using the shared connection, but cannot manage keys.
+
+Before saving credentials, set `SIPD_AI_ENCRYPTION_KEY` to a Fernet key generated
+with the installed Python environment:
+
+```sh
+.venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+```
+
+Store this encryption key in the protected service environment, separately from
+SQLite, and back it up. Do not regenerate it during deployments. Losing it
+requires re-entering the provider API keys. Keys are encrypted in SQLite and
+never displayed after saving. Empty key fields keep existing credentials;
+**Remove key** explicitly deletes them.
+
+In **Settings → AI pricing**, enter OpenAI and/or Claude API keys and model IDs,
+select the active service, and save. Choose a model with web-search support.
+**Test connection** makes a paid web-enabled request; it does not update assets.
+API and search costs for all SIP-D users are billed to the configured account.
+Subscription/account login is not used.
+
+Refresh batches the requesting user's uncached AI instruments into one prompt.
+Only public symbols, currency, units, and current time are sent; portfolio
+balances, quantities, transactions, and user identities are excluded. The
+provider may make multiple searches within that request. Quotes are cached
+for 15 minutes across users. A shared SQLite lease prevents overlapping calls,
+and provider failures trigger cooldown. No automatic provider switch or paid
+retry occurs. A crashed in-flight refresh may be retried after five minutes;
+exactly-once external billing cannot be guaranteed across a process crash.
+
+Returned prices require matching symbols, currencies and units, a source URL
+from retrieved search results, and an actual quote timestamp within seven days.
+Latest market closes are permitted outside trading hours. Sources and dates
+are shown on asset details and ticker lookup. These are sourced AI extractions,
+not guaranteed real-time quotes or independently verified market data.
+Invalid or missing results preserve the user's last prices. Transaction price
+lookup remains editable and does not create a portfolio snapshot.
+
+AI requests have a 60-second total deadline. The supplied Gunicorn launchers use
+two workers and a 180-second worker timeout; the Nginx example allows 190 seconds.
+These limits provide room for normal mixed-provider portfolios; very large
+legacy-provider portfolios can still exceed the request timeout. Restore both
+the database and its encryption key when moving the installation.
