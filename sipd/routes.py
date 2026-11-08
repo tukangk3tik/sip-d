@@ -2,12 +2,15 @@ import bcrypt
 import secrets
 import time
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from flask import jsonify, make_response, redirect, render_template, render_template_string, request
 
-from sipd.auth import anon_token, create_session, current_user, delete_session, require_user, valid_anon_csrf, valid_user_csrf
+from sipd.auth import require_admin, anon_token, create_session, current_user, delete_session, require_user, valid_anon_csrf, valid_user_csrf
 from sipd.db import connect, transaction
+from sipd.ai_settings import read_ai_settings, save_ai_settings
+from sipd.ai_provider import Instrument
+from sipd.ai_pricing import get_ai_quotes, test_ai_connection
 from sipd.domain import LedgerEntry, calculate_position
 from sipd.i18n import translate
 from sipd.providers import quote_for_asset, usd_idr_quote, yahoo_chart_quote, yahoo_quotes
@@ -74,8 +77,8 @@ def register_routes(app):
 
     def save_asset_quote(db, user_id, asset, quote):
         db.execute(
-            "INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)",
-            (user_id, asset["id"], str(quote.price), quote.currency, quote.source, as_db_time(quote.at)),
+            "INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at,source_url,price_kind) VALUES(?,?,?,?,?,?,?,?)",
+            (user_id, asset["id"], str(quote.price), quote.currency, quote.source, as_db_time(quote.at),quote.source_url,quote.price_kind),
         )
 
     def safe_next(default="/settings"):
@@ -321,8 +324,10 @@ def register_routes(app):
         except ValueError:
             return "Invalid asset", 400
         mode, provider, provider_symbol = request.form.get("pricing_mode"), request.form.get("provider", "").strip(), request.form.get("provider_symbol", "").strip()
-        if not name or not unit or not 0 <= scale <= 12 or request.form.get("quote_currency") not in {"IDR", "USD"} or mode not in {"manual", "automatic", "fixed"} or (mode == "automatic" and (provider not in {"yahoo", "finnhub", "kraken", "metalsdev"} or not provider_symbol)):
+        if not name or not unit or not 0 <= scale <= 12 or request.form.get("quote_currency") not in {"IDR", "USD"} or mode not in {"manual", "automatic", "fixed"} or (mode == "automatic" and (provider not in {"yahoo", "finnhub", "kraken", "metalsdev", "ai_scrape"} or not provider_symbol)):
             return "Invalid asset", 400
+        if provider == "ai_scrape" and (len(provider_symbol)>64 or len(unit)>64):
+            return "Invalid AI instrument",400
         db = connect(app.config["SIPD_DB"])
         try:
             if not db.execute("SELECT 1 FROM investment_types WHERE id=? AND user_id=?", (type_id, user.id)).fetchone():
@@ -362,7 +367,14 @@ def register_routes(app):
             transactions = db.execute("SELECT * FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at DESC,id DESC", (current_user().id, asset_id)).fetchall() if asset else []
         finally:
             db.close()
-        return user_page("asset_detail", asset["name"], asset=asset, transactions=transactions) if asset else ("Not found", 404)
+        latest = None
+        if asset:
+            db = connect(app.config["SIPD_DB"])
+            try:
+                latest = db.execute("SELECT * FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC,id DESC LIMIT 1",(current_user().id,asset_id)).fetchone()
+            finally:
+                db.close()
+        return user_page("asset_detail", asset["name"], asset=asset, transactions=transactions, latest=latest) if asset else ("Not found", 404)
 
     @app.post("/transactions")
     @require_user
@@ -482,9 +494,35 @@ def register_routes(app):
         db = connect(app.config["SIPD_DB"])
         try:
             types = db.execute("SELECT id,name,active FROM investment_types WHERE user_id=? ORDER BY active DESC,name", (current_user().id,)).fetchall()
+            ai = read_ai_settings(db)
         finally:
             db.close()
-        return user_page("settings", "Settings", types=types)
+        return user_page("settings", "Settings", types=types, ai=ai, ai_error=request.args.get("ai_error", ""))
+
+    @app.post("/settings/ai")
+    @app.post("/settings/ai/<service>/<action>")
+    @require_admin
+    def ai_settings_save(service=None, action=None):
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        if service and (service not in {"openai", "claude"} or action not in {"remove-key", "test"}):
+            return "Not found", 404
+        if action == "test":
+            ok, message = test_ai_connection(app.config["SIPD_DB"], encryption_key=app.config["SIPD_AI_ENCRYPTION_KEY"], service=service)
+            return message, 200 if ok else 503
+        db = connect(app.config["SIPD_DB"])
+        try:
+            current = read_ai_settings(db)
+            save_ai_settings(db, encryption_key=app.config["SIPD_AI_ENCRYPTION_KEY"],
+                active_service=current["active_service"] if action else request.form.get("active_service") or None,
+                models={} if action else {s: request.form.get(s+"_model", "") for s in ("openai", "claude")},
+                replacements={} if action else {s: request.form.get(s+"_key", "") for s in ("openai", "claude")},
+                removals={service} if action == "remove-key" else set())
+        except ValueError as error:
+            return str(error), 400
+        finally:
+            db.close()
+        return redirect("/settings", 303)
 
     @app.post("/settings/currency")
     @require_user
@@ -548,15 +586,23 @@ def register_routes(app):
             db.close()
         return redirect("/settings", 303)
 
-    @app.get("/settings/tickers")
+    @app.route("/settings/tickers", methods=["GET","POST"])
     @require_user
     def ticker_check():
-        provider, query = request.args.get("provider", "yahoo"), request.args.get("q", "").strip()
-        if provider not in {"yahoo", "finnhub"}:
+        provider, query = request.values.get("provider", "yahoo"), request.values.get("q", "").strip()
+        if provider not in {"yahoo", "finnhub", "ai_scrape"}:
             return user_page("ticker_check", "Ticker lookup", provider=provider, query=query, error="Unsupported ticker provider")
         if len(query) > 64 or any(ord(char) < 32 for char in query):
             return user_page("ticker_check", "Ticker lookup", provider=provider, query=query, error="Search must be 1–64 printable characters")
         result = None
+        if query and provider == "ai_scrape":
+            if request.method == "POST" and not valid_user_csrf():
+                return "Invalid CSRF token",403
+            instrument = Instrument(query,request.values.get("currency","IDR"),request.values.get("unit","share"))
+            batch = get_ai_quotes(app.config["SIPD_DB"],(instrument,),encryption_key=app.config["SIPD_AI_ENCRYPTION_KEY"],allow_fetch=request.method=="POST")
+            result = batch.quotes.get(instrument)
+            if not result:
+                return user_page("ticker_check","Ticker lookup",provider=provider,query=query,error="AI quote unavailable")
         if query and provider == "yahoo":
             quotes, errors = yahoo_quotes((query,))
             if query in quotes:
@@ -575,7 +621,13 @@ def register_routes(app):
             return "Missing refresh key", 400
         db = connect(app.config["SIPD_DB"])
         try:
-            if db.execute("SELECT 1 FROM price_refreshes WHERE user_id=? AND refresh_key=?", (user.id, key)).fetchone():
+            claim_token = secrets.token_urlsafe(24)
+            with transaction(db):
+                prior = db.execute("SELECT * FROM price_refreshes WHERE user_id=? AND refresh_key=?", (user.id,key)).fetchone()
+                can_claim = not prior or (prior["status"] == "running" and prior["claim_expires_at"] and parse_db_time(prior["claim_expires_at"]) < datetime.now(timezone.utc))
+                if can_claim:
+                    db.execute("INSERT INTO price_refreshes(user_id,refresh_key,status,claim_token,claim_expires_at) VALUES(?,?,'running',?,?) ON CONFLICT(user_id,refresh_key) DO UPDATE SET claim_token=excluded.claim_token,claim_expires_at=excluded.claim_expires_at", (user.id,key,claim_token,as_db_time(datetime.now(timezone.utc)+timedelta(minutes=5))))
+            if not can_claim:
                 return redirect("/", 303)
             assets = db.execute("SELECT id,name,unit,pricing_mode,quote_currency,provider,provider_symbol FROM assets WHERE user_id=? AND active=1", (user.id,)).fetchall()
             yahoo_assets = [asset for asset in assets if asset["pricing_mode"] == "automatic" and asset["provider"] == "yahoo"]
@@ -583,6 +635,20 @@ def register_routes(app):
             ttl_seconds = int(app.config["SIPD_QUOTE_CACHE_TTL_SECONDS"])
             details, errors, yahoo_live_assets = [], [], []
             t = lambda key: translate(user.language, key)
+            ai_assets = [a for a in assets if a["pricing_mode"] == "automatic" and a["provider"] == "ai_scrape"]
+            ai_quotes = get_ai_quotes(app.config["SIPD_DB"], tuple(Instrument(a["provider_symbol"], a["quote_currency"], a["unit"]) for a in ai_assets), encryption_key=app.config["SIPD_AI_ENCRYPTION_KEY"])
+            with transaction(db):
+                for asset in ai_assets:
+                    instrument = Instrument(asset["provider_symbol"],asset["quote_currency"],asset["unit"])
+                    quote = ai_quotes.quotes.get(instrument)
+                    current = db.execute("SELECT * FROM assets WHERE id=? AND user_id=? AND active=1",(asset["id"],user.id)).fetchone()
+                    previous = latest_asset_price(db,user.id,asset["id"])
+                    claim_valid = db.execute("SELECT 1 FROM price_refreshes WHERE user_id=? AND refresh_key=? AND claim_token=?",(user.id,key,claim_token)).fetchone()
+                    if quote and claim_valid and (not previous or parse_db_time(previous["priced_at"]) <= quote.at) and current and all(current[k] == asset[k] for k in ("provider","provider_symbol","quote_currency","unit","pricing_mode")) and read_ai_settings(db)["revision"] == ai_quotes.revision:
+                        save_asset_quote(db,user.id,asset,quote)
+                        details.append(f"{asset['name']}: AI price updated")
+                    else:
+                        errors.append(f"{asset['name']}: AI quote unavailable; using last known price")
             try:
                 rate = usd_idr_quote()
                 db.execute("INSERT INTO exchange_rates(user_id,base_currency,quote_currency,rate,source,priced_at) VALUES(?,'USD','IDR',?,?,?)", (user.id, str(rate.price), rate.source, rate.at.isoformat().replace("+00:00", "Z")))
@@ -650,7 +716,7 @@ def register_routes(app):
                 save_asset_quote(db, user.id, asset, quote)
                 details.append(f"{asset['name']}: {t('Updated successfully')}")
             for asset in assets:
-                if asset["pricing_mode"] != "automatic" or asset["provider"] == "yahoo":
+                if asset["pricing_mode"] != "automatic" or asset["provider"] in {"yahoo", "ai_scrape"}:
                     continue
                 try:
                     quote = quote_for_asset(asset, metals_key=app.config["SIPD_METALS_API_KEY"], finnhub_key=app.config["SIPD_FINNHUB_API_KEY"])
@@ -663,6 +729,9 @@ def register_routes(app):
             total = net_invested = realized = unrealized = Decimal()
             snapshot_items = []
             db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM price_refreshes WHERE user_id=? AND refresh_key=? AND claim_token=?", (user.id,key,claim_token)).fetchone():
+                db.rollback()
+                return redirect("/",303)
             for asset in assets:
                 rows = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at,id", (user.id, asset["id"])).fetchall()
                 entries = [LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in rows]
@@ -682,7 +751,7 @@ def register_routes(app):
                 unrealized += value - position.cost_basis
                 snapshot_items.append((asset, position, price, fx_rate, value))
             status = "partial" if errors else "success"
-            db.execute("INSERT INTO price_refreshes(user_id,refresh_key,status,error_summary) VALUES(?,?,?,?)", (user.id, key, status, "; ".join(details + errors)))
+            db.execute("UPDATE price_refreshes SET status=?,error_summary=? WHERE user_id=? AND refresh_key=? AND claim_token=?", (status, "; ".join(details + errors), user.id, key, claim_token))
             db.execute("INSERT INTO portfolio_snapshots(user_id,refresh_key,total_value_idr,net_invested_idr,realized_pl_idr,unrealized_pl_idr) VALUES(?,?,?,?,?,?)", (user.id, key, str(total), str(net_invested), str(realized), str(unrealized)))
             snapshot_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
             for asset, position, price, fx_rate, value in snapshot_items:
@@ -692,7 +761,7 @@ def register_routes(app):
             db.close()
         return redirect("/", 303)
 
-    @app.get("/api/assets/<int:asset_id>/price")
+    @app.route("/api/assets/<int:asset_id>/price", methods=["GET","POST"])
     @require_user
     def price_lookup(asset_id):
         db = connect(app.config["SIPD_DB"])
@@ -704,7 +773,15 @@ def register_routes(app):
             return "Not found", 404
         if asset["pricing_mode"] == "fixed":
             return jsonify(price="1", currency=asset["quote_currency"], source="Fixed", timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
-        if asset["provider"] == "yahoo":
+        if asset["provider"] == "ai_scrape":
+            if request.method == "POST" and not valid_user_csrf():
+                return "Invalid CSRF token", 403
+            instrument = Instrument(asset["provider_symbol"], asset["quote_currency"], asset["unit"])
+            batch = get_ai_quotes(app.config["SIPD_DB"], (instrument,), encryption_key=app.config["SIPD_AI_ENCRYPTION_KEY"], allow_fetch=request.method == "POST")
+            quote = batch.quotes.get(instrument)
+            if quote:
+                return jsonify(price=str(quote.price),currency=quote.currency,source=quote.source,timestamp=quote.at.isoformat(),source_url=quote.source_url,price_kind=quote.price_kind)
+        elif asset["provider"] == "yahoo":
             quotes, _errors = yahoo_quotes((asset["provider_symbol"],))
             quote = quotes.get(asset["provider_symbol"])
             if not quote:

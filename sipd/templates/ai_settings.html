@@ -1,0 +1,14 @@
+<section><h2>{{ _('AI pricing') }}</h2>
+<p>{{ _('Shared connection for all users. API and search usage is billed to the configured account.') }}</p>
+{% if user.is_admin %}
+<form method="post" action="/settings/ai">
+<input type="hidden" name="csrf_token" value="{{ csrf }}">
+<label>{{ _('Active service') }}<select name="active_service"><option value="">{{ _('Disabled') }}</option>{% for service in ['openai','claude'] %}<option value="{{ service }}" {% if ai.active_service == service %}selected{% endif %}>{{ service }}</option>{% endfor %}</select></label>
+{% for service in ['openai','claude'] %}
+<label>{{ service }} {{ _('Model') }}<input name="{{ service }}_model" value="{{ ai[service ~ '_model'] }}" maxlength="128"></label>
+<label>{{ service }} API key — {{ _('Configured') if ai[service ~ '_configured'] else _('Not configured') }}<input type="password" name="{{ service }}_key" autocomplete="new-password" value=""></label>
+{% endfor %}
+<p>{{ _('Leave a key blank to keep the saved key.') }}</p><button>{{ _('Save') }}</button></form>
+{% for service in ['openai','claude'] %}<form class="inline-form" method="post"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button formaction="/settings/ai/{{ service }}/test">{{ service }}: {{ _('Test connection (uses API credits)') }}</button><button class="danger" formaction="/settings/ai/{{ service }}/remove-key">{{ _('Remove key') }}</button></form>{% endfor %}
+{% else %}<p>{{ _('Connection managed by the administrator.') }} {{ ai.active_service or _('Disabled') }}</p>{% endif %}
+</section>

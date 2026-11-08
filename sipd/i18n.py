@@ -72,6 +72,17 @@ TRANSLATIONS = {
 }
 
 
+TRANSLATIONS["ID"].update({
+    "AI pricing":"Harga AI", "Active service":"Layanan aktif", "Disabled":"Nonaktif",
+    "Model":"Model", "Configured":"Terkonfigurasi", "Not configured":"Belum dikonfigurasi",
+    "Shared connection for all users. API and search usage is billed to the configured account.":"Koneksi bersama untuk semua pengguna. Biaya API dan pencarian ditagihkan ke akun yang dikonfigurasi.",
+    "Leave a key blank to keep the saved key.":"Kosongkan kunci untuk mempertahankan kunci tersimpan.",
+    "Test connection (uses API credits)":"Uji koneksi (menggunakan kredit API)",
+    "Remove key":"Hapus kunci", "Connection managed by the administrator.":"Koneksi dikelola administrator.",
+    "Lookup price":"Cari harga", "Quote source":"Sumber harga",
+})
+
+
 def translate(language: str, key: str) -> str:
     if language == "EN":
         return key
