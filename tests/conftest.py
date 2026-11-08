@@ -37,3 +37,11 @@ def existing_session(app):
     finally:
         db.close()
     return token
+
+
+@pytest.fixture
+def admin_session(app, existing_session):
+    db = connect(app.config["SIPD_DB"])
+    db.execute("UPDATE users SET is_admin=1 WHERE username='owner'")
+    db.close()
+    return existing_session

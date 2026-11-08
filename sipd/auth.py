@@ -17,6 +17,7 @@ class User:
     csrf: str
     currency: str
     language: str
+    is_admin: bool = False
 
 
 def session_hash(token: str) -> str:
@@ -33,7 +34,7 @@ def current_user() -> User | None:
     db = connect(current_app.config["SIPD_DB"])
     try:
         row = db.execute(
-            """SELECT u.id,u.username,s.csrf_token,us.display_currency,us.language,s.expires_at
+            """SELECT u.id,u.username,u.is_admin,s.csrf_token,us.display_currency,us.language,s.expires_at
                FROM sessions s JOIN users u ON u.id=s.user_id
                JOIN user_settings us ON us.user_id=u.id WHERE s.id_hash=?""",
             (session_hash(token),),
@@ -43,7 +44,7 @@ def current_user() -> User | None:
     if not row or row["expires_at"] <= datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"):
         g.user = None
     else:
-        g.user = User(row["id"], row["username"], row["csrf_token"], row["display_currency"], row["language"])
+        g.user = User(row["id"], row["username"], row["csrf_token"], row["display_currency"], row["language"], bool(row["is_admin"]))
     return g.user
 
 
@@ -61,6 +62,16 @@ def anon_token(response):
     if not request.cookies.get("sipd_csrf"):
         response.set_cookie("sipd_csrf", token, httponly=True, samesite="Lax", secure=current_app.config["SIPD_BASE_URL"].startswith("https://"))
     return token
+
+
+def require_admin(view):
+    @wraps(view)
+    @require_user
+    def wrapped(*args, **kwargs):
+        if not current_user().is_admin:
+            return "Administrator access required", 403
+        return view(*args, **kwargs)
+    return wrapped
 
 
 def valid_anon_csrf() -> bool:

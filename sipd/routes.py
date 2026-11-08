@@ -125,7 +125,7 @@ def register_routes(app):
                 username, password = request.form.get("username", "").strip(), request.form.get("password", "")
                 if not 3 <= len(username) <= 64 or len(password) < 12:
                     return "Username must be 3–64 characters and password at least 12 characters.", 400
-                db.execute("INSERT INTO users(username,password_hash) VALUES(?,?)", (username, bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()))
+                db.execute("INSERT INTO users(username,password_hash,is_admin) VALUES(?,?,1)", (username, bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()))
                 user_id = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()[0]
                 db.execute("INSERT INTO user_settings(user_id) VALUES(?)", (user_id,))
                 for name in ("Cash", "Gold", "Money Market", "Stocks", "BTC"):
