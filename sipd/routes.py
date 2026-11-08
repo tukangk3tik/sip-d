@@ -497,7 +497,7 @@ def register_routes(app):
             ai = read_ai_settings(db)
         finally:
             db.close()
-        return user_page("settings", "Settings", types=types, ai=ai, ai_error=request.args.get("ai_error", ""))
+        return user_page("settings", "Settings", types=types, ai=ai, ai_error=request.args.get("ai_error", ""), ai_test=request.args.get("ai_test", ""))
 
     @app.post("/settings/ai")
     @app.post("/settings/ai/<service>/<action>")
@@ -509,7 +509,9 @@ def register_routes(app):
             return "Not found", 404
         if action == "test":
             ok, message = test_ai_connection(app.config["SIPD_DB"], encryption_key=app.config["SIPD_AI_ENCRYPTION_KEY"], service=service)
-            return message, 200 if ok else 503
+            if request.accept_mimetypes.best == "application/json":
+                return jsonify(ok=ok, message=translate(current_user().language, message)), 200 if ok else 503
+            return redirect("/settings?ai_test=" + ("success" if ok else "failure"), 303)
         db = connect(app.config["SIPD_DB"])
         try:
             current = read_ai_settings(db)
