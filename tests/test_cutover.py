@@ -12,5 +12,5 @@ def test_app_opens_production_format_database(tmp_path):
 
 def test_python_systemd_unit_runs_gunicorn():
     unit = Path("deploy/sip-d-python.service").read_text()
-    assert "gunicorn --bind ${SIPD_ADDR} sipd.wsgi:app" in unit
+    assert "gunicorn --workers 2 --timeout 180 --bind ${SIPD_ADDR} sipd.wsgi:app" in unit
     assert "ReadWritePaths=/var/lib/sip-d" in unit

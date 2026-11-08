@@ -24,3 +24,17 @@ CREATE TABLE IF NOT EXISTS price_refreshes(id INTEGER PRIMARY KEY, user_id INTEG
 CREATE INDEX IF NOT EXISTS price_refreshes_user ON price_refreshes(user_id,created_at DESC);
 CREATE TABLE IF NOT EXISTS quote_cache(id INTEGER PRIMARY KEY, provider TEXT NOT NULL, symbol TEXT NOT NULL, price TEXT, currency TEXT, source TEXT NOT NULL DEFAULT '', fetched_at TEXT, error TEXT NOT NULL DEFAULT '', error_at TEXT, failure_count INTEGER NOT NULL DEFAULT 0, backoff_until TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(provider,symbol));
 CREATE INDEX IF NOT EXISTS quote_cache_provider_symbol ON quote_cache(provider,symbol);
+
+CREATE TABLE IF NOT EXISTS ai_settings(
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    active_service TEXT CHECK(active_service IN ('openai','claude')),
+    openai_model TEXT NOT NULL DEFAULT '', claude_model TEXT NOT NULL DEFAULT '',
+    openai_key TEXT NOT NULL DEFAULT '', claude_key TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT OR IGNORE INTO ai_settings(id) VALUES(1);
+CREATE TABLE IF NOT EXISTS ai_runtime(
+    service TEXT PRIMARY KEY CHECK(service IN ('openai','claude')),
+    lease_token TEXT, lease_until TEXT, failure_count INTEGER NOT NULL DEFAULT 0,
+    backoff_until TEXT
+);

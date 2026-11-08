@@ -15,6 +15,8 @@ class Quote:
     currency: str
     source: str
     at: datetime
+    source_url: str = ""
+    price_kind: str = ""
 
 
 def _map_final_closes(frame, symbols):

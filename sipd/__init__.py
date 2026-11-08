@@ -10,6 +10,7 @@ from sipd.routes import register_routes
 def create_app(config: dict | None = None) -> Flask:
     app = Flask(__name__, static_folder="../static")
     app.config.from_mapping(
+        SIPD_AI_ENCRYPTION_KEY=os.environ.get("SIPD_AI_ENCRYPTION_KEY", ""),
         SIPD_DB=os.environ.get("SIPD_DB", "data/sip-d.db"),
         SIPD_BASE_URL=os.environ.get("SIPD_BASE_URL", ""),
         SIPD_METALS_API_KEY=os.environ.get("SIPD_METALS_API_KEY", ""),

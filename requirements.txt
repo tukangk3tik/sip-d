@@ -4,3 +4,4 @@ bcrypt>=4,<5
 requests>=2.32,<3
 yfinance>=1,<2
 pytest>=8,<9
+cryptography>=46,<51

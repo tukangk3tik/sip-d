@@ -12,7 +12,7 @@ WorkingDirectory=/opt/sip-d
 EnvironmentFile=-/etc/sip-d.env
 Environment=SIPD_ADDR=127.0.0.1:8090
 Environment=SIPD_DB=/var/lib/sip-d/sip-d.db
-ExecStart=/opt/sip-d/venv/bin/gunicorn --bind ${SIPD_ADDR} sipd.wsgi:app
+ExecStart=/opt/sip-d/venv/bin/gunicorn --workers 2 --timeout 180 --bind ${SIPD_ADDR} sipd.wsgi:app
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15
