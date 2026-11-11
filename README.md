@@ -60,6 +60,8 @@ Resetting P/L records each asset's current quantity and market value as a new re
 
 Deleting an erroneous transaction is allowed only when replaying the remaining ledger does not create a negative holding. A dashboard snapshot is created only by manual **Refresh Prices**, never by transaction price lookup.
 
+For manual-priced assets, open **Assets**, select the asset, and use **Update price** to enter a positive price per unit in the asset's quote currency. The price is saved with the current timestamp and source `Manual`, updating valuation without changing transactions or cost basis. The newest dated price is used, including prices from later transactions. Saving a price does not create a portfolio snapshot.
+
 ## Providers
 
 - **Kraken** public ticker: keyless BTC/USD last-trade price. Use provider `kraken` and symbol `XBTUSD`.
