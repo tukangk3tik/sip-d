@@ -290,6 +290,44 @@ def test_dashboard_renders_jinja_navigation(client, existing_session):
     assert "Portfolio" in page.text
 
 
+def test_reset_realized_pnl_preserves_ledger_and_recalculates_from_baseline(client, existing_session, app):
+    db = connect(app.config["SIPD_DB"])
+    try:
+        db.execute("INSERT INTO assets(user_id,investment_type_id,name,unit,quote_currency,pricing_mode) VALUES(1,1,'Fund','unit','IDR','manual')")
+        db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,idempotency_key) VALUES(1,1,'buy','2','100','IDR','1','2026-08-26T10:00:00Z','buy')")
+        db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,idempotency_key) VALUES(1,1,'sell','1','80','IDR','1','2026-08-27T10:00:00Z','first-sell')")
+        db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(1,1,'120','IDR','Manual','2026-08-27T11:00:00Z')")
+    finally:
+        db.close()
+    client.set_cookie("sipd_session", existing_session)
+
+    assert "-20.00 IDR" in client.get("/").text
+    response = client.post("/pnl/reset", data={"csrf_token": "csrf"})
+    assert response.status_code == 303
+    reset_page = client.get("/").text
+    assert reset_page.count("0.00 IDR") >= 2
+
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT count(*) FROM transactions").fetchone()[0] == 2
+        db.execute("INSERT INTO transactions(user_id,asset_id,kind,quantity,unit_price,quote_currency,fx_rate_to_idr,occurred_at,idempotency_key) VALUES(1,1,'sell','1','130','IDR','1','2099-08-28T10:00:00Z','second-sell')")
+    finally:
+        db.close()
+
+    assert "10.00 IDR" in client.get("/").text
+
+
+def test_reset_realized_pnl_requires_csrf(client, existing_session, app):
+    client.set_cookie("sipd_session", existing_session)
+
+    assert client.post("/pnl/reset", data={"csrf_token": "wrong"}).status_code == 403
+    db = connect(app.config["SIPD_DB"])
+    try:
+        assert db.execute("SELECT count(*) FROM pnl_resets").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
 def test_dashboard_renders_a_mobile_navigation_control(client, existing_session):
     client.set_cookie("sipd_session", existing_session)
     page = client.get("/")
