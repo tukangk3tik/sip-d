@@ -73,7 +73,7 @@ def register_routes(app):
         db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) SELECT user_id,asset_id,unit_price,quote_currency,'Transaction',occurred_at FROM transactions WHERE user_id=? AND asset_id=?", (user_id, asset_id))
 
     def latest_asset_price(db, user_id, asset_id):
-        return db.execute("SELECT price,currency,source,priced_at FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (user_id, asset_id)).fetchone()
+        return db.execute("SELECT price,currency,source,priced_at FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY julianday(priced_at) DESC,id DESC LIMIT 1", (user_id, asset_id)).fetchone()
 
     def save_asset_quote(db, user_id, asset, quote):
         db.execute(
@@ -158,7 +158,7 @@ def register_routes(app):
         try:
             rate_row = db.execute("SELECT rate FROM exchange_rates WHERE user_id=? AND base_currency='USD' AND quote_currency='IDR' ORDER BY priced_at DESC LIMIT 1", (user.id,)).fetchone()
             rate = Decimal(rate_row["rate"]) if rate_row else Decimal()
-            assets = db.execute("SELECT a.id,a.name,a.unit,a.quote_currency,a.pricing_mode,t.name type_name,COALESCE((SELECT price FROM asset_prices p WHERE p.user_id=a.user_id AND p.asset_id=a.id ORDER BY priced_at DESC LIMIT 1),'') price FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.user_id=? AND a.active=1 ORDER BY a.name", (user.id,)).fetchall()
+            assets = db.execute("SELECT a.id,a.name,a.unit,a.quote_currency,a.pricing_mode,t.name type_name,COALESCE((SELECT price FROM asset_prices p WHERE p.user_id=a.user_id AND p.asset_id=a.id ORDER BY julianday(p.priced_at) DESC,p.id DESC LIMIT 1),'') price FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.user_id=? AND a.active=1 ORDER BY a.name", (user.id,)).fetchall()
             reset = db.execute("SELECT id,created_at FROM pnl_resets WHERE user_id=? ORDER BY id DESC LIMIT 1", (user.id,)).fetchone()
             holdings, total, net_invested, realized, unrealized, type_totals = [], Decimal(), Decimal(), Decimal(), Decimal(), {}
             for asset in assets:
@@ -217,7 +217,7 @@ def register_routes(app):
                 reset_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
                 for asset in assets:
                     position = calculate_position(ledger_entries(db, user.id, asset["id"]))
-                    latest = db.execute("SELECT price FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (user.id, asset["id"])).fetchone()
+                    latest = db.execute("SELECT price FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY julianday(priced_at) DESC,id DESC LIMIT 1", (user.id, asset["id"])).fetchone()
                     price = Decimal("1") if asset["pricing_mode"] == "fixed" else Decimal(latest["price"]) if latest else Decimal()
                     fx_rate = rate if asset["quote_currency"] == "USD" else Decimal("1")
                     cutoff = db.execute("SELECT COALESCE(MAX(id),0) FROM transactions WHERE user_id=? AND asset_id=?", (user.id, asset["id"])).fetchone()[0]
@@ -326,7 +326,7 @@ def register_routes(app):
                    LEFT JOIN asset_prices p ON p.id=(
                        SELECT id FROM asset_prices
                        WHERE user_id=a.user_id AND asset_id=a.id
-                       ORDER BY priced_at DESC,id DESC LIMIT 1
+                       ORDER BY julianday(priced_at) DESC,id DESC LIMIT 1
                    )
                    WHERE a.user_id=?
                    ORDER BY a.active DESC,t.name,a.name""",
@@ -410,10 +410,35 @@ def register_routes(app):
         if asset:
             db = connect(app.config["SIPD_DB"])
             try:
-                latest = db.execute("SELECT * FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC,id DESC LIMIT 1",(current_user().id,asset_id)).fetchone()
+                latest = db.execute("SELECT * FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY julianday(priced_at) DESC,id DESC LIMIT 1",(current_user().id,asset_id)).fetchone()
             finally:
                 db.close()
         return user_page("asset_detail", asset["name"], asset=asset, transactions=transactions, latest=latest) if asset else ("Not found", 404)
+
+    @app.post("/assets/<int:asset_id>/price")
+    @require_user
+    def manual_price_save(asset_id):
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        try:
+            price = Decimal(request.form.get("price", ""))
+        except InvalidOperation:
+            return "Invalid price", 400
+        if not price.is_finite() or price <= 0:
+            return "Invalid price", 400
+        user = current_user()
+        db = connect(app.config["SIPD_DB"])
+        try:
+            with transaction(db):
+                asset = db.execute("SELECT pricing_mode,quote_currency FROM assets WHERE id=? AND user_id=?", (asset_id, user.id)).fetchone()
+                if not asset:
+                    return "Not found", 404
+                if asset["pricing_mode"] != "manual":
+                    return "Only manual-priced assets can be updated", 400
+                db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset_id, str(price), asset["quote_currency"], "Manual", as_db_time(datetime.now(timezone.utc))))
+        finally:
+            db.close()
+        return redirect(f"/assets/{asset_id}", 303)
 
     @app.post("/transactions")
     @require_user
@@ -779,7 +804,7 @@ def register_routes(app):
                 if not entries:
                     continue
                 position = calculate_position(entries)
-                latest = db.execute("SELECT price FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (user.id, asset["id"])).fetchone()
+                latest = db.execute("SELECT price FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY julianday(priced_at) DESC,id DESC LIMIT 1", (user.id, asset["id"])).fetchone()
                 price = Decimal("1") if asset["pricing_mode"] == "fixed" else Decimal(latest["price"]) if latest else Decimal()
                 fx_rate = Decimal("1")
                 if asset["quote_currency"] == "USD":
@@ -841,7 +866,7 @@ def register_routes(app):
                 pass
         db = connect(app.config["SIPD_DB"])
         try:
-            last = db.execute("SELECT price,currency,source,priced_at FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (current_user().id, asset_id)).fetchone()
+            last = db.execute("SELECT price,currency,source,priced_at FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY julianday(priced_at) DESC,id DESC LIMIT 1", (current_user().id, asset_id)).fetchone()
         finally:
             db.close()
         if last:
