@@ -182,7 +182,6 @@ def register_routes(app):
                 unrealized += holding["unrealized"]
                 type_totals[asset["type_name"]] = type_totals.get(asset["type_name"], Decimal()) + value
             snapshots = db.execute("SELECT created_at,total_value_idr FROM portfolio_snapshots WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (user.id,)).fetchall()
-            refresh = db.execute("SELECT status,error_summary,created_at FROM price_refreshes WHERE user_id=? ORDER BY id DESC LIMIT 1", (user.id,)).fetchone()
         finally:
             db.close()
         display_currency = "USD" if user.currency == "USD" and rate > 0 else "IDR"
@@ -198,8 +197,7 @@ def register_routes(app):
         top = [dict(holding, value=money(holding["market_value"]), percent=f"{(holding['market_value'] / total * 100) if total else Decimal():.1f}") for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)[:3]]
         for holding in holdings:
             holding.update(value=money(holding["market_value"]), unrealized_display=money(holding["unrealized"]), performance="gain" if holding["unrealized"] > 0 else "loss" if holding["unrealized"] < 0 else "")
-        refresh_errors = [part.strip() for part in (refresh["error_summary"] if refresh else "").split(";") if part.strip()]
-        return user_page("dashboard", "Dashboard", holdings=holdings, top=top, total=money(total), net_invested=money(net_invested), realized=money(realized), unrealized=money(unrealized), total_return=f"{((realized + unrealized) / net_invested * 100) if net_invested else Decimal():.1f}", type_alloc=[allocation(name, value) for name, value in sorted(type_totals.items(), key=lambda item: item[1], reverse=True)], asset_alloc=[allocation(holding["name"], holding["market_value"]) for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)], snapshots=[{"created_at": row["created_at"], "value": money(Decimal(row["total_value_idr"]))} for row in snapshots], refresh=refresh, refresh_errors=refresh_errors, refresh_key=secrets.token_urlsafe(18), pnl_reset_at=reset["created_at"] if reset else None)
+        return user_page("dashboard", "Dashboard", holdings=holdings, top=top, total=money(total), net_invested=money(net_invested), realized=money(realized), unrealized=money(unrealized), total_return=f"{((realized + unrealized) / net_invested * 100) if net_invested else Decimal():.1f}", type_alloc=[allocation(name, value) for name, value in sorted(type_totals.items(), key=lambda item: item[1], reverse=True)], asset_alloc=[allocation(holding["name"], holding["market_value"]) for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)], snapshots=[{"created_at": row["created_at"], "value": money(Decimal(row["total_value_idr"]))} for row in snapshots], refresh_key=secrets.token_urlsafe(18), pnl_reset_at=reset["created_at"] if reset else None)
 
     @app.post("/pnl/reset")
     @require_user
@@ -400,6 +398,7 @@ def register_routes(app):
     @app.get("/assets/<int:asset_id>")
     @require_user
     def asset_detail(asset_id):
+        refresh_notes = []
         db = connect(app.config["SIPD_DB"])
         try:
             asset = db.execute("SELECT a.*,t.name type_name FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.id=? AND a.user_id=?", (asset_id, current_user().id)).fetchone()
@@ -411,9 +410,13 @@ def register_routes(app):
             db = connect(app.config["SIPD_DB"])
             try:
                 latest = db.execute("SELECT * FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY julianday(priced_at) DESC,id DESC LIMIT 1",(current_user().id,asset_id)).fetchone()
+                refresh_notes = db.execute("""SELECT n.message,n.warning,r.created_at FROM price_refresh_notes n
+                    JOIN price_refreshes r ON r.id=n.refresh_id
+                    WHERE r.id=(SELECT id FROM price_refreshes WHERE user_id=? AND status<>'running' ORDER BY id DESC LIMIT 1)
+                    AND (n.asset_id=? OR (n.asset_id IS NULL AND ?='USD'))""", (current_user().id, asset_id, asset["quote_currency"])).fetchall()
             finally:
                 db.close()
-        return user_page("asset_detail", asset["name"], asset=asset, transactions=transactions, latest=latest) if asset else ("Not found", 404)
+        return user_page("asset_detail", asset["name"], asset=asset, transactions=transactions, latest=latest, refresh_notes=refresh_notes) if asset else ("Not found", 404)
 
     @app.post("/assets/<int:asset_id>/price")
     @require_user
@@ -700,6 +703,12 @@ def register_routes(app):
             now = datetime.now(timezone.utc)
             ttl_seconds = int(app.config["SIPD_QUOTE_CACHE_TTL_SECONDS"])
             details, errors, yahoo_live_assets = [], [], []
+            refresh_notes = []
+
+            def add_note(asset, message, warning=False):
+                (errors if warning else details).append(f"{asset['name']}: {message}" if asset else message)
+                refresh_notes.append((asset["id"] if asset else None, message, warning))
+
             t = lambda key: translate(user.language, key)
             ai_assets = [a for a in assets if a["pricing_mode"] == "automatic" and a["provider"] == "ai_scrape"]
             ai_quotes = get_ai_quotes(app.config["SIPD_DB"], tuple(Instrument(a["provider_symbol"], a["quote_currency"], a["unit"]) for a in ai_assets), encryption_key=app.config["SIPD_AI_ENCRYPTION_KEY"])
@@ -712,14 +721,14 @@ def register_routes(app):
                     claim_valid = db.execute("SELECT 1 FROM price_refreshes WHERE user_id=? AND refresh_key=? AND claim_token=?",(user.id,key,claim_token)).fetchone()
                     if quote and claim_valid and (not previous or parse_db_time(previous["priced_at"]) <= quote.at) and current and all(current[k] == asset[k] for k in ("provider","provider_symbol","quote_currency","unit","pricing_mode")) and read_ai_settings(db)["revision"] == ai_quotes.revision:
                         save_asset_quote(db,user.id,asset,quote)
-                        details.append(f"{asset['name']}: AI price updated")
+                        add_note(asset, "AI price updated")
                     else:
-                        errors.append(f"{asset['name']}: AI quote unavailable; using last known price")
+                        add_note(asset, "AI quote unavailable; using last known price", warning=True)
             try:
                 rate = usd_idr_quote()
                 db.execute("INSERT INTO exchange_rates(user_id,base_currency,quote_currency,rate,source,priced_at) VALUES(?,'USD','IDR',?,?,?)", (user.id, str(rate.price), rate.source, rate.at.isoformat().replace("+00:00", "Z")))
             except ValueError as error:
-                errors.append(f"USD/IDR: {error}")
+                add_note(None, f"USD/IDR: {error}", warning=True)
             for asset in yahoo_assets:
                 cached = get_cached_quote(db, "yahoo", asset["provider_symbol"])
                 quote = cached_quote_to_quote(cached)
@@ -727,12 +736,12 @@ def register_routes(app):
                 backoff_until = parse_db_time(cached["backoff_until"]) if cached else None
                 if quote and fetched_at and (now - fetched_at).total_seconds() <= ttl_seconds and quote.currency == asset["quote_currency"] and quote.price > 0:
                     save_asset_quote(db, user.id, asset, quote)
-                    details.append(f"{asset['name']}: {t('Using cached price')}")
+                    add_note(asset, t("Using cached price"))
                     continue
                 if backoff_until and backoff_until > now:
                     last = latest_asset_price(db, user.id, asset["id"])
                     detail = f"{t('Provider temporarily unavailable')}; {t('Using last known price')}" if last else t("Provider temporarily unavailable")
-                    errors.append(f"{asset['name']}: {detail}")
+                    add_note(asset, detail, warning=True)
                     continue
                 yahoo_live_assets.append(asset)
             quotes, provider_errors = {}, {}
@@ -762,9 +771,9 @@ def register_routes(app):
                         )
                         last = latest_asset_price(db, user.id, asset["id"])
                         if last:
-                            errors.append(f"{asset['name']}: {t('Using last known price')}")
+                            add_note(asset, t("Using last known price"), warning=True)
                         else:
-                            errors.append(f"{asset['name']}: {message}")
+                            add_note(asset, message, warning=True)
                         continue
                 if quote.price <= 0 or quote.currency != asset["quote_currency"]:
                     record_quote_failure(
@@ -776,11 +785,11 @@ def register_routes(app):
                         initial_seconds=int(app.config["SIPD_QUOTE_BACKOFF_INITIAL_SECONDS"]),
                         max_seconds=int(app.config["SIPD_QUOTE_BACKOFF_MAX_SECONDS"]),
                     )
-                    errors.append(f"{asset['name']}: provider returned invalid price")
+                    add_note(asset, "provider returned invalid price", warning=True)
                     continue
                 save_cached_quote(db, "yahoo", asset["provider_symbol"], quote)
                 save_asset_quote(db, user.id, asset, quote)
-                details.append(f"{asset['name']}: {t('Updated successfully')}")
+                add_note(asset, t("Updated successfully"))
             for asset in assets:
                 if asset["pricing_mode"] != "automatic" or asset["provider"] in {"yahoo", "ai_scrape"}:
                     continue
@@ -789,8 +798,9 @@ def register_routes(app):
                     if quote.price <= 0 or quote.currency != asset["quote_currency"]:
                         raise ValueError("provider returned invalid price")
                     db.execute("INSERT INTO asset_prices(user_id,asset_id,price,currency,source,priced_at) VALUES(?,?,?,?,?,?)", (user.id, asset["id"], str(quote.price), quote.currency, quote.source, quote.at.isoformat().replace("+00:00", "Z")))
+                    add_note(asset, t("Updated successfully"))
                 except ValueError as error:
-                    errors.append(f"{asset['name']}: {error}")
+                    add_note(asset, str(error), warning=True)
 
             total = net_invested = realized = unrealized = Decimal()
             snapshot_items = []
@@ -818,6 +828,8 @@ def register_routes(app):
                 snapshot_items.append((asset, position, price, fx_rate, value))
             status = "partial" if errors else "success"
             db.execute("UPDATE price_refreshes SET status=?,error_summary=? WHERE user_id=? AND refresh_key=? AND claim_token=?", (status, "; ".join(details + errors), user.id, key, claim_token))
+            refresh_id = db.execute("SELECT id FROM price_refreshes WHERE user_id=? AND refresh_key=?", (user.id, key)).fetchone()[0]
+            db.executemany("INSERT INTO price_refresh_notes(refresh_id,asset_id,message,warning) VALUES(?,?,?,?)", [(refresh_id, asset_id, message, warning) for asset_id, message, warning in refresh_notes])
             db.execute("INSERT INTO portfolio_snapshots(user_id,refresh_key,total_value_idr,net_invested_idr,realized_pl_idr,unrealized_pl_idr) VALUES(?,?,?,?,?,?)", (user.id, key, str(total), str(net_invested), str(realized), str(unrealized)))
             snapshot_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
             for asset, position, price, fx_rate, value in snapshot_items:

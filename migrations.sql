@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshot_items(id INTEGER PRIMARY KEY, snap
 CREATE INDEX IF NOT EXISTS snapshot_items_owner ON portfolio_snapshot_items(user_id,snapshot_id);
 CREATE TABLE IF NOT EXISTS price_refreshes(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, refresh_key TEXT NOT NULL, status TEXT NOT NULL, error_summary TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,refresh_key));
 CREATE INDEX IF NOT EXISTS price_refreshes_user ON price_refreshes(user_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS price_refresh_notes(refresh_id INTEGER NOT NULL REFERENCES price_refreshes(id) ON DELETE CASCADE, asset_id INTEGER REFERENCES assets(id) ON DELETE CASCADE, message TEXT NOT NULL, warning INTEGER NOT NULL DEFAULT 0 CHECK(warning IN (0,1)));
 CREATE TABLE IF NOT EXISTS quote_cache(id INTEGER PRIMARY KEY, provider TEXT NOT NULL, symbol TEXT NOT NULL, price TEXT, currency TEXT, source TEXT NOT NULL DEFAULT '', fetched_at TEXT, error TEXT NOT NULL DEFAULT '', error_at TEXT, failure_count INTEGER NOT NULL DEFAULT 0, backoff_until TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(provider,symbol));
 CREATE INDEX IF NOT EXISTS quote_cache_provider_symbol ON quote_cache(provider,symbol);
 CREATE TABLE IF NOT EXISTS ai_settings(

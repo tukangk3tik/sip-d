@@ -366,11 +366,13 @@ def test_dashboard_uses_indonesian_by_default_with_card_lists(client, existing_s
 
     assert '<html lang="id">' in page.text
     assert "Aset terbesar" in page.text
-    assert "Status penyegaran" in page.text
+    assert "Status penyegaran" not in page.text
     assert "largest-card" in page.text
-    assert "refresh-card" in page.text
-    assert "BBCA failed" in page.text
-    assert "BTC failed" in page.text
+    assert "refresh-card" not in page.text
+    assert "BBCA failed" not in page.text
+    assert "BTC failed" not in page.text
+    assert 'action="/refresh"' in page.text
+    assert "Riwayat portofolio" in page.text
 
 
 def test_dashboard_uses_english_when_selected(client, existing_session, app):
@@ -661,6 +663,7 @@ def test_refresh_uses_fresh_quote_cache_without_provider_call(client, existing_s
     monkeypatch.setattr(routes, "yahoo_quotes", lambda symbols: (_ for _ in ()).throw(AssertionError("provider should not be called")))
     client.set_cookie("sipd_session", existing_session)
     assert client.post("/refresh", data={"csrf_token": "csrf", "refresh_key": "cache"}).status_code == 303
+    assert "Menggunakan harga cache" in client.get("/assets/1").text
     db = connect(app.config["SIPD_DB"])
     try:
         assert db.execute("SELECT price FROM asset_prices WHERE asset_id=1").fetchone()[0] == "4100"
@@ -702,6 +705,7 @@ def test_refresh_skips_yahoo_symbol_during_backoff(client, existing_session, app
     monkeypatch.setattr(routes, "yahoo_quotes", lambda symbols: (_ for _ in ()).throw(AssertionError("provider should not be called")))
     client.set_cookie("sipd_session", existing_session)
     assert client.post("/refresh", data={"csrf_token": "csrf", "refresh_key": "backoff"}).status_code == 303
+    assert "Penyedia sementara tidak tersedia; Menggunakan harga terakhir" in client.get("/assets/1").text
     db = connect(app.config["SIPD_DB"])
     try:
         row = db.execute("SELECT status,error_summary FROM price_refreshes WHERE refresh_key='backoff'").fetchone()

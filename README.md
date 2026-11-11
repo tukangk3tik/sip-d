@@ -72,6 +72,8 @@ For manual-priced assets, open **Assets**, select the asset, and use **Update pr
 
 Provider calls have a six-second timeout and one limited retry. A failed refresh never overwrites the last valid price. Successful assets are retained and failures are shown per asset.
 
+Refresh notes and warnings appear on each asset's detail page, including USD/IDR warnings for USD assets. The dashboard keeps the refresh button and portfolio history. Per-asset notes are recorded starting with the next refresh after upgrading; existing combined refresh logs remain stored.
+
 ## Flask cutover
 
 Back up the existing SQLite database, install the Python app and virtual environment in `/opt/sip-d`, then install `deploy/sip-d-python.service` as `/etc/systemd/system/sip-d-python.service`.
