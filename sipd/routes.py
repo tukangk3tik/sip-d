@@ -11,7 +11,7 @@ from sipd.db import connect, transaction
 from sipd.ai_settings import read_ai_settings, save_ai_settings
 from sipd.ai_provider import Instrument
 from sipd.ai_pricing import get_ai_quotes, test_ai_connection
-from sipd.domain import LedgerEntry, calculate_position
+from sipd.domain import LedgerEntry, Position, calculate_position
 from sipd.i18n import translate
 from sipd.providers import quote_for_asset, usd_idr_quote, yahoo_chart_quote, yahoo_quotes
 from sipd.repositories import as_db_time, cached_quote_to_quote, get_cached_quote, parse_db_time, record_quote_failure, save_cached_quote
@@ -87,6 +87,11 @@ def register_routes(app):
             return target
         return default
 
+    def cumulative_realized(db, user_id, *, active_only=False):
+        active_clause = " AND a.active=1" if active_only else ""
+        assets = db.execute(f"SELECT a.id FROM assets a WHERE a.user_id=?{active_clause}", (user_id,)).fetchall()
+        return sum((calculate_position(ledger_entries(db, user_id, asset["id"])).realized for asset in assets), Decimal())
+
     def asset_status_save(asset_id, active):
         if not valid_user_csrf():
             return "Invalid CSRF token", 403
@@ -154,10 +159,19 @@ def register_routes(app):
             rate_row = db.execute("SELECT rate FROM exchange_rates WHERE user_id=? AND base_currency='USD' AND quote_currency='IDR' ORDER BY priced_at DESC LIMIT 1", (user.id,)).fetchone()
             rate = Decimal(rate_row["rate"]) if rate_row else Decimal()
             assets = db.execute("SELECT a.id,a.name,a.unit,a.quote_currency,a.pricing_mode,t.name type_name,COALESCE((SELECT price FROM asset_prices p WHERE p.user_id=a.user_id AND p.asset_id=a.id ORDER BY priced_at DESC LIMIT 1),'') price FROM assets a JOIN investment_types t ON t.id=a.investment_type_id WHERE a.user_id=? AND a.active=1 ORDER BY a.name", (user.id,)).fetchall()
+            reset = db.execute("SELECT id,created_at FROM pnl_resets WHERE user_id=? ORDER BY id DESC LIMIT 1", (user.id,)).fetchone()
             holdings, total, net_invested, realized, unrealized, type_totals = [], Decimal(), Decimal(), Decimal(), Decimal(), {}
             for asset in assets:
                 rows = db.execute("SELECT id,kind,quantity,unit_price,fx_rate_to_idr,occurred_at FROM transactions WHERE user_id=? AND asset_id=? ORDER BY occurred_at,id", (user.id, asset["id"])).fetchall()
-                position = calculate_position([LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in rows])
+                entries = [LedgerEntry(row["id"], row["kind"], Decimal(row["quantity"]), Decimal(row["unit_price"]), Decimal(row["fx_rate_to_idr"]), datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00"))) for row in rows]
+                reset_item = db.execute("SELECT transaction_id_cutoff,quantity,cost_basis_idr FROM pnl_reset_items WHERE reset_id=? AND asset_id=? AND user_id=?", (reset["id"], asset["id"], user.id)).fetchone() if reset else None
+                if reset_item:
+                    reset_quantity = Decimal(reset_item["quantity"])
+                    reset_basis = Decimal(reset_item["cost_basis_idr"])
+                    initial = Position(quantity=reset_quantity, average_cost=reset_basis / reset_quantity if reset_quantity else Decimal(), cost_basis=reset_basis, net_invested=reset_basis)
+                    position = calculate_position([entry for entry in entries if entry.id > reset_item["transaction_id_cutoff"]], initial)
+                else:
+                    position = calculate_position(entries)
                 price = Decimal("1") if asset["pricing_mode"] == "fixed" else Decimal(asset["price"] or "0")
                 value = position.quantity * price * (rate if asset["quote_currency"] == "USD" else Decimal("1"))
                 holding = dict(asset, quantity=position.quantity, market_value=value, unrealized=value - position.cost_basis, net_invested=position.net_invested, realized=position.realized, has_price=bool(asset["price"]) or asset["pricing_mode"] == "fixed")
@@ -185,7 +199,32 @@ def register_routes(app):
         for holding in holdings:
             holding.update(value=money(holding["market_value"]), unrealized_display=money(holding["unrealized"]), performance="gain" if holding["unrealized"] > 0 else "loss" if holding["unrealized"] < 0 else "")
         refresh_errors = [part.strip() for part in (refresh["error_summary"] if refresh else "").split(";") if part.strip()]
-        return user_page("dashboard", "Dashboard", holdings=holdings, top=top, total=money(total), net_invested=money(net_invested), realized=money(realized), unrealized=money(unrealized), total_return=f"{((realized + unrealized) / net_invested * 100) if net_invested else Decimal():.1f}", type_alloc=[allocation(name, value) for name, value in sorted(type_totals.items(), key=lambda item: item[1], reverse=True)], asset_alloc=[allocation(holding["name"], holding["market_value"]) for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)], snapshots=[{"created_at": row["created_at"], "value": money(Decimal(row["total_value_idr"]))} for row in snapshots], refresh=refresh, refresh_errors=refresh_errors, refresh_key=secrets.token_urlsafe(18))
+        return user_page("dashboard", "Dashboard", holdings=holdings, top=top, total=money(total), net_invested=money(net_invested), realized=money(realized), unrealized=money(unrealized), total_return=f"{((realized + unrealized) / net_invested * 100) if net_invested else Decimal():.1f}", type_alloc=[allocation(name, value) for name, value in sorted(type_totals.items(), key=lambda item: item[1], reverse=True)], asset_alloc=[allocation(holding["name"], holding["market_value"]) for holding in sorted(holdings, key=lambda holding: holding["market_value"], reverse=True)], snapshots=[{"created_at": row["created_at"], "value": money(Decimal(row["total_value_idr"]))} for row in snapshots], refresh=refresh, refresh_errors=refresh_errors, refresh_key=secrets.token_urlsafe(18), pnl_reset_at=reset["created_at"] if reset else None)
+
+    @app.post("/pnl/reset")
+    @require_user
+    def pnl_reset():
+        if not valid_user_csrf():
+            return "Invalid CSRF token", 403
+        user = current_user()
+        db = connect(app.config["SIPD_DB"])
+        try:
+            rate_row = db.execute("SELECT rate FROM exchange_rates WHERE user_id=? AND base_currency='USD' AND quote_currency='IDR' ORDER BY priced_at DESC LIMIT 1", (user.id,)).fetchone()
+            rate = Decimal(rate_row["rate"]) if rate_row else Decimal()
+            assets = db.execute("SELECT id,quote_currency,pricing_mode FROM assets WHERE user_id=?", (user.id,)).fetchall()
+            with transaction(db):
+                db.execute("INSERT INTO pnl_resets(user_id,realized_pl_idr) VALUES(?,?)", (user.id, str(cumulative_realized(db, user.id))))
+                reset_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+                for asset in assets:
+                    position = calculate_position(ledger_entries(db, user.id, asset["id"]))
+                    latest = db.execute("SELECT price FROM asset_prices WHERE user_id=? AND asset_id=? ORDER BY priced_at DESC LIMIT 1", (user.id, asset["id"])).fetchone()
+                    price = Decimal("1") if asset["pricing_mode"] == "fixed" else Decimal(latest["price"]) if latest else Decimal()
+                    fx_rate = rate if asset["quote_currency"] == "USD" else Decimal("1")
+                    cutoff = db.execute("SELECT COALESCE(MAX(id),0) FROM transactions WHERE user_id=? AND asset_id=?", (user.id, asset["id"])).fetchone()[0]
+                    db.execute("INSERT INTO pnl_reset_items(reset_id,user_id,asset_id,transaction_id_cutoff,quantity,cost_basis_idr) VALUES(?,?,?,?,?,?)", (reset_id, user.id, asset["id"], cutoff, str(position.quantity), str(position.quantity * price * fx_rate)))
+        finally:
+            db.close()
+        return redirect("/", 303)
 
     @app.route("/login", methods=["GET", "POST"])
     def login():

@@ -22,8 +22,8 @@ class Position:
     net_invested: Decimal = Decimal()
 
 
-def calculate_position(entries: list[LedgerEntry]) -> Position:
-    position = Position()
+def calculate_position(entries: list[LedgerEntry], initial: Position | None = None) -> Position:
+    position = Position(**vars(initial)) if initial else Position()
     for entry in sorted(entries, key=lambda value: (value.at, value.id)):
         if not all(value > 0 for value in (entry.quantity, entry.price, entry.fx_to_idr)):
             raise ValueError("quantity, price, and exchange rate must be positive")

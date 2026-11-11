@@ -13,6 +13,7 @@ The Flask application runs as a single Gunicorn process with server-rendered HTM
 - First-owner setup, bcrypt passwords, server-side expiring sessions, CSRF protection, and login rate limiting.
 - User-owned investment types, assets, and transaction ledger with strict ownership filters.
 - Exact-decimal weighted-average cost, realized/unrealized P/L, and over-sell protection.
+- Portfolio-wide P/L reset that rebases every asset at its current market value without deleting assets or transaction history.
 - Manual pricing plus Kraken BTC/USD and optional Metals.dev gold prices.
 - Keyless daily USD/IDR reference rates from Frankfurter.
 - Manual refresh snapshots with idempotency and partial-failure reporting.
@@ -54,6 +55,8 @@ All persisted quantities, prices, rates, and calculated values are decimal strin
 - Unrealized P/L: `current converted market value − remaining cost basis`.
 - Net invested capital: buys/deposits minus sell/withdrawal proceeds, using each transaction's preserved FX rate.
 - Total return: `(realized P/L + unrealized P/L) / net invested capital × 100`. It is shown as zero when net invested capital is not positive.
+
+Resetting P/L records each asset's current quantity and market value as a new reporting baseline. Existing assets and transactions remain unchanged; later transactions and price movements calculate realized and unrealized P/L from that baseline.
 
 Deleting an erroneous transaction is allowed only when replaying the remaining ledger does not create a negative holding. A dashboard snapshot is created only by manual **Refresh Prices**, never by transaction price lookup.
 

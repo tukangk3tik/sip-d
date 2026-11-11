@@ -36,6 +36,9 @@ def init_db(path: str | Path) -> None:
                             db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
                 db.execute("UPDATE users SET is_admin=1 WHERE id=(SELECT id FROM users ORDER BY created_at,id LIMIT 1)")
                 db.execute("INSERT INTO schema_migrations VALUES(2,CURRENT_TIMESTAMP)")
+        reset_item_columns = {row["name"] for row in db.execute("PRAGMA table_info(pnl_reset_items)")}
+        if reset_item_columns and "transaction_id_cutoff" not in reset_item_columns:
+            db.execute("ALTER TABLE pnl_reset_items ADD COLUMN transaction_id_cutoff INTEGER NOT NULL DEFAULT 0")
     finally:
         db.close()
 

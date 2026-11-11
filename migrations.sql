@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS price_refreshes(id INTEGER PRIMARY KEY, user_id INTEG
 CREATE INDEX IF NOT EXISTS price_refreshes_user ON price_refreshes(user_id,created_at DESC);
 CREATE TABLE IF NOT EXISTS quote_cache(id INTEGER PRIMARY KEY, provider TEXT NOT NULL, symbol TEXT NOT NULL, price TEXT, currency TEXT, source TEXT NOT NULL DEFAULT '', fetched_at TEXT, error TEXT NOT NULL DEFAULT '', error_at TEXT, failure_count INTEGER NOT NULL DEFAULT 0, backoff_until TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(provider,symbol));
 CREATE INDEX IF NOT EXISTS quote_cache_provider_symbol ON quote_cache(provider,symbol);
-
 CREATE TABLE IF NOT EXISTS ai_settings(
     id INTEGER PRIMARY KEY CHECK(id=1),
     active_service TEXT CHECK(active_service IN ('openai','claude')),
@@ -38,3 +37,7 @@ CREATE TABLE IF NOT EXISTS ai_runtime(
     lease_token TEXT, lease_until TEXT, failure_count INTEGER NOT NULL DEFAULT 0,
     backoff_until TEXT
 );
+CREATE TABLE IF NOT EXISTS pnl_resets(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, realized_pl_idr TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS pnl_resets_user_date ON pnl_resets(user_id,id DESC);
+CREATE TABLE IF NOT EXISTS pnl_reset_items(id INTEGER PRIMARY KEY, reset_id INTEGER NOT NULL REFERENCES pnl_resets(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE, transaction_id_cutoff INTEGER NOT NULL, quantity TEXT NOT NULL, cost_basis_idr TEXT NOT NULL, UNIQUE(reset_id,asset_id));
+CREATE INDEX IF NOT EXISTS pnl_reset_items_owner ON pnl_reset_items(user_id,reset_id);
